@@ -10,6 +10,8 @@ Run `BUILD_VCS.bat` from this directory for the normal performance build. Genera
 
 The launchers automatically locate CMake from PATH, Visual Studio 2022 (including the bundled CMake component), `vswhere`, or a standard standalone CMake installation. `BUILD_VCS_FAST.bat` remains the quickest development/debug-oriented build.
 
+For an alternate toolchain that provide build using LLVM's clang-cl/lld-link instead of MSVC, see [MSVC+clang (clang-cl / lld-link) build](#msvcclang-clang-cl--lld-link-build) below.
+
 For the single-configuration Ninja workflow used during incremental renderer and
 generated-code development, see [`../../docs/VCS_NINJA_BUILD.md`](../../docs/VCS_NINJA_BUILD.md).
 
@@ -73,6 +75,35 @@ profiles\vcs\scripts\play.bat D:\VCS_GAME_ROOT
 ```
 
 For an uncapped CPU/GE measurement, use `profiles\vcs\scripts\bench.bat`.
+
+### MSVC+clang (clang-cl / lld-link) build
+
+An alternate Windows toolchain is available using LLVM's clang-cl compiler and lld-link linker instead of MSVC's cl.exe/link.exe. This pipeline currently provides a performance uplift compared to the standard MSVC build.
+
+This setup requires a **standalone LLVM installation** (e.g. `winget install LLVM.LLVM` or https://releases.llvm.org/), do not use Clang bundled with Visual Studio Build Tools as it is an older release with a known compiler hang. A VS2022 Build Tools install is still required to supply the Windows SDK and MSVC STL headers. Because clang-cl does not integrate cleanly with MSBuild, these scripts configure the build using the Ninja generator.
+
+Fast development build (O2, LTO disabled):
+
+```text
+profiles\vcs\BUILD_VCS_FAST_CLANGCL.bat
+
+```
+
+Optimized release build (O3, PGO, AVX2, tier-2 transforms, automated ctest/DX12 probes):
+
+```text
+profiles\vcs\BUILD_VCS_WIN_DX12_CLANGCL.bat
+
+```
+
+Run with the default local game directory:
+
+```text
+profiles\vcs\PLAY_VCS_CLANGCL.bat
+
+```
+
+*Note:* Both scripts output to isolated build folders (`out\vcs-fast-clangcl` and `out\vcs-release-ninja-clangcl`). The play script automatically uses the release executable first, falling back to the fast build if missing.
 
 ### Windows link memory
 

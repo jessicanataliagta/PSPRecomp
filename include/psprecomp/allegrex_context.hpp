@@ -866,10 +866,12 @@ struct alignas(16) AllegrexContext {
         // VDOT prefix semantics use a four-lane view even for a shorter encoded vector.
         apply_vfpu_source_prefix_ct<4u, 0u>(source);
         apply_vfpu_source_prefix_ct<4u, 1u>(target);
-        const float result[1]{
-            source[0] * target[0] + source[1] * target[1] +
-            source[2] * target[2] + source[3] * target[3]
-        };
+        float sum = 0.0f;
+        sum += source[0] * target[0];
+        sum += source[1] * target[1];
+        sum += source[2] * target[2];
+        sum += source[3] * target[3];
+        const float result[1]{sum};
         write_vfpu_vector_with_destination_prefix_ct<DestinationScalarRegister, 1u>(result);
     }
 
@@ -914,8 +916,11 @@ struct alignas(16) AllegrexContext {
         apply_vfpu_source_prefix_ct<4u, 0u>(source);
         vfpu_ctrl[0] = original_source_prefix;
         apply_vfpu_source_prefix_ct<4u, 1u>(target);
-        float sum = source[0] * target[0] + source[1] * target[1] +
-                    source[2] * target[2] + source[3] * target[3];
+        float sum = 0.0f;
+        sum += source[0] * target[0];
+        sum += source[1] * target[1];
+        sum += source[2] * target[2];
+        sum += source[3] * target[3];
         if (std::isnan(sum)) sum = std::fabs(sum);
         const float result[1]{sum};
         write_vfpu_vector_with_destination_prefix_ct<DestinationScalarRegister, 1u>(result);
@@ -1854,8 +1859,12 @@ struct alignas(16) AllegrexContext {
         };
         apply_vfpu_source_prefix_ct<4u, 0u>(final_row);
         apply_vfpu_source_prefix_ct<4u, 1u>(target);
-        result[Side - 1u] = final_row[0] * target[0] + final_row[1] * target[1] +
-                            final_row[2] * target[2] + final_row[3] * target[3];
+        float last_row_sum = 0.0f;
+        last_row_sum += final_row[0] * target[0];
+        last_row_sum += final_row[1] * target[1];
+        last_row_sum += final_row[2] * target[2];
+        last_row_sum += final_row[3] * target[3];
+        result[Side - 1u] = last_row_sum;
         const std::uint32_t destination_prefix = vfpu_ctrl[2];
         constexpr std::uint32_t last_lane = Side - 1u;
         vfpu_ctrl[2] = ((destination_prefix & (1u << 8u)) << last_lane) |

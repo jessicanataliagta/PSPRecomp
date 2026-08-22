@@ -1849,8 +1849,15 @@ int main() {
         unaligned_aot.aot_store32_block(batch_vram, batch_write);
         std::uint32_t batch_vram_read[4]{};
         unaligned_aot.aot_load32_block(batch_vram, batch_vram_read);
-        require(!unaligned_aot.aot_try_load32_block(batch_vram, batch_try),
-                "AOT EDRAM block unexpectedly used RAM direct path");
+        // V7 fastmem maps VRAM into the sparse arena, so direct access covers it. 
+        // Only the fallback path rejects out-of-bounds VRAM.
+        if (unaligned_aot.direct_fastmem_enabled()) {
+            require(unaligned_aot.aot_try_load32_block(batch_vram, batch_try),
+                    "AOT EDRAM block should use the direct fastmem arena path when active");
+        } else {
+            require(!unaligned_aot.aot_try_load32_block(batch_vram, batch_try),
+                    "AOT EDRAM block unexpectedly used RAM-array direct path without fastmem");
+        }
         for (std::size_t i = 0; i < 4u; ++i)
             require(batch_vram_read[i] == batch_write[i], "AOT 32-bit EDRAM block fallback failed");
 
