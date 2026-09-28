@@ -157,7 +157,8 @@ def check(root: Path) -> None:
         'PSPRECOMP_V8155_HARD_FORCE_ASYNC' in main and
         SAFE_ASYNC_MARK in main and
         '_putenv_s("PSPRECOMP_GE_ASYNC", async_opt_in ? "1" : "0")' in main and
-        '_putenv_s("PSPRECOMP_GE_PARALLEL_VERTEX_DECODE", async_opt_in ? "1" : "0")' in main
+        ('_putenv_s("PSPRECOMP_GE_PARALLEL_VERTEX_DECODE", async_opt_in ? "1" : "0")' in main or
+         '_putenv_s("PSPRECOMP_GE_PARALLEL_VERTEX_DECODE", parallel_decode_enabled ? "1" : "0")' in main)
     )
     if not (v8151_conditional or v8155_hard or v8155_safe):
         raise RuntimeError('V8.15.1 check: neither V8.15.1 conditional nor V8.15.5 hard activation is present')

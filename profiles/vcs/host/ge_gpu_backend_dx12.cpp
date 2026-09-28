@@ -49,8 +49,10 @@ constexpr std::uint32_t kReferenceHeight = 272u;
 constexpr std::size_t kGeometryUploadCapacity = 64u * 1024u * 1024u;
 // V4 ExecuteIndirect arguments live in their own persistently mapped upload
 // arena. Keeping them separate means a draw-heavy frame can never steal bytes
-// from the established 64 MiB geometry budget. 4 MiB holds >20k commands.
-constexpr std::size_t kIndirectUploadCapacity = 4u * 1024u * 1024u;
+// from the established 64 MiB geometry budget. The shadow-aware command is
+// 260/264 bytes, so 16 MiB covers more than 60k commands before falling back
+// to the ordinary path.
+constexpr std::size_t kIndirectUploadCapacity = 16u * 1024u * 1024u;
 // Stage 45.2: persistent per-frame texture upload arena. The 44.7 path created,
 // mapped and destroyed one committed upload resource for every decoded texture.
 // Streaming bursts therefore paid kernel/D3D12 allocation overhead on the hot GE
@@ -66,6 +68,7 @@ constexpr UINT kSrvCapacity = 65536u;
 constexpr UINT kSamplerCapacity = 128u;
 constexpr UINT kFramebufferTargetCapacity = 256u;
 constexpr UINT kAmdVendorId = 0x1002u;
+constexpr UINT kNvidiaVendorId = 0x10DEu;
 constexpr std::size_t kPacked0115GuestStride = 10u;
 constexpr UINT kPacked0115NativeStride = 10u;
 constexpr UINT kPacked0115AmdUmaStride = 12u;
@@ -133,22 +136,23 @@ struct Dx12PixelConstants {
 };
 static_assert(sizeof(Dx12PixelConstants) == 5u * sizeof(std::uint32_t));
 
-// Tier-2 V4 / 150-FPS path. ExecuteIndirect moves the two per-draw root
-// constant writes and Draw* call out of the CPU command-recording loop.  Runs
-// still preserve guest order; only adjacent draws with identical fixed GPU
-// state participate.
+// Tier-2 V4 / 150-FPS path. ExecuteIndirect moves the per-draw root constant
+// writes and Draw* call out of the CPU command-recording loop. The private
+// material-shadow matrix is included in the command as well, so enabling the
+// path does not require disabling realtime shadows. Runs still preserve guest
+// order; only adjacent draws with identical fixed GPU state participate.
 struct Dx12IndirectDrawCommand {
     std::uint32_t transform[40]{};
-    std::uint32_t pixel[5]{};
+    std::uint32_t pixel_and_shadow[21]{};
     D3D12_DRAW_ARGUMENTS draw{};
 };
 struct Dx12IndirectDrawIndexedCommand {
     std::uint32_t transform[40]{};
-    std::uint32_t pixel[5]{};
+    std::uint32_t pixel_and_shadow[21]{};
     D3D12_DRAW_INDEXED_ARGUMENTS draw{};
 };
-static_assert(sizeof(Dx12IndirectDrawCommand) == 196u);
-static_assert(sizeof(Dx12IndirectDrawIndexedCommand) == 200u);
+static_assert(sizeof(Dx12IndirectDrawCommand) == 260u);
+static_assert(sizeof(Dx12IndirectDrawIndexedCommand) == 264u);
 
 struct CloudCameraCandidate {
     std::array<float, 12> view{};
@@ -1237,18 +1241,22 @@ bool adjacent_batch_merge_compatible(const Dx12Batch &a, const Dx12Batch &b) noe
     return !a.hardware_transform || hardware_transform_equal(a.transform, b.transform);
 }
 
-bool dx12_execute_indirect_enabled() noexcept {
-    static const bool enabled = [] {
-        // V4 telemetry showed thousands of saved Draw* calls with essentially
-        // unchanged GE time. Building/uploading indirect records is therefore
-        // not part of the production fast path until a workload proves a win.
-        // Keep it as an explicit A/B switch.
+bool dx12_execute_indirect_enabled(const Dx12GeState &s) noexcept {
+    // V5 carries the complete 21-DWORD root state (including material
+    // shadows), but the matched NVIDIA A/B trace showed lower total FPS even
+    // when GE time improved slightly: guest-side work rose enough to lose
+    // about 3.7%. Keep this experimental path explicit instead of silently
+    // enabling it when the executable is launched directly.
+    static const int environment_override = [] {
         const char *text = std::getenv("PSPRECOMP_DX12_EXECUTE_INDIRECT");
-        return text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0 &&
-               std::strcmp(text, "false") != 0 && std::strcmp(text, "FALSE") != 0 &&
-               std::strcmp(text, "off") != 0 && std::strcmp(text, "OFF") != 0;
+        if (text == nullptr || *text == '\0') return -1;
+        const bool enabled = std::strcmp(text, "0") != 0 &&
+            std::strcmp(text, "false") != 0 && std::strcmp(text, "FALSE") != 0 &&
+            std::strcmp(text, "off") != 0 && std::strcmp(text, "OFF") != 0;
+        return enabled ? 1 : 0;
     }();
-    return enabled;
+    (void)s;
+    return environment_override > 0;
 }
 
 D3D12_PRIMITIVE_TOPOLOGY batch_topology(const Dx12Batch &batch) noexcept {
@@ -2015,7 +2023,10 @@ bool create_indirect_signatures(Dx12GeState &s, std::string &error) noexcept {
     args[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
     args[1].Constant.RootParameterIndex = 3u;
     args[1].Constant.DestOffsetIn32BitValues = 0u;
-    args[1].Constant.Num32BitValuesToSet = 5u;
+    // Five pixel-state DWORDs followed by the sixteen per-draw material
+    // shadow-matrix DWORDs.  The direct path writes the same 21-value root
+    // parameter in two calls; ExecuteIndirect must carry the complete state.
+    args[1].Constant.Num32BitValuesToSet = 21u;
 
     D3D12_COMMAND_SIGNATURE_DESC desc{};
     desc.NumArgumentDescs = static_cast<UINT>(args.size());
@@ -5377,11 +5388,7 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
     Dx12FramebufferTarget *display_target = find_framebuffer_target(s, s.display_framebuffer);
 
     Dx12FrameResources &frame = s.frames[s.frame_cursor];
-    const auto &proper_config = vcs_configuration().proper_shaders;
-    const bool material_shadow_requested = proper_config.enabled &&
-        proper_config.realtime_shadows.enabled && proper_shaders_private_available();
-    const bool indirect_enabled = dx12_execute_indirect_enabled() &&
-        !material_shadow_requested &&
+    const bool indirect_enabled = dx12_execute_indirect_enabled(s) &&
         !s.amd_uma_safe_mode &&
         s.indirect_draw_signature && s.indirect_draw_indexed_signature &&
         frame.indirect_upload_buffer && frame.mapped_indirect_upload != nullptr;
@@ -5497,6 +5504,20 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
         s, material_shadow_ready ? s.realtime_shadow_map.srv_index : 0u));
     s.list->RSSetViewports(1u, &viewport);
     if (index_bytes != 0u) s.list->IASetIndexBuffer(&ib);
+
+    // Keep direct and indirect draws on the exact same shadow constants. The
+    // indirect command carries all 21 DWORDs of root parameter 3, so it must
+    // not inherit the previous batch's model-to-light matrix.
+    const auto make_shadow_rows = [&](const Dx12Batch &draw_batch) {
+        std::array<float, 16> rows{};
+        if (material_shadow_ready && draw_batch.hardware_transform &&
+            draw_batch.draw.shader_pipe != GeShaderPipe::Native) {
+            const std::array<float, 16> model_to_light = shadow_multiply_mat4(
+                material_shadow_light_vp, draw_batch.transform.model_to_world);
+            shadow_matrix_rows(model_to_light, rows.data());
+        }
+        return rows;
+    };
 
     bool clouds_injected = false;
     bool cloud_depth_writing_world_seen = false;
@@ -5731,13 +5752,7 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
             const Dx12TransformConstants draw_transform =
                 make_transform_constants(batch, logical_width, logical_height);
             const Dx12PixelConstants pixel_state = make_pixel_constants(batch.draw, srv_index != 0u);
-            std::array<float, 16> shadow_rows{};
-            if (material_shadow_ready && batch.hardware_transform &&
-                batch.draw.shader_pipe != GeShaderPipe::Native) {
-                const std::array<float, 16> model_to_light = shadow_multiply_mat4(
-                    material_shadow_light_vp, batch.transform.model_to_world);
-                shadow_matrix_rows(model_to_light, shadow_rows.data());
-            }
+            const std::array<float, 16> shadow_rows = make_shadow_rows(batch);
             if (!active_transform_valid ||
                 std::memcmp(&draw_transform, &active_transform, sizeof(draw_transform)) != 0) {
                 s.list->SetGraphicsRoot32BitConstants(2u, 40u, &draw_transform, 0u);
@@ -5825,7 +5840,10 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
                     if (batch.indexed) {
                         Dx12IndirectDrawIndexedCommand command{};
                         std::memcpy(command.transform, &itransform, sizeof(itransform));
-                        std::memcpy(command.pixel, &ipixel, sizeof(ipixel));
+                        std::memcpy(command.pixel_and_shadow, &ipixel, sizeof(ipixel));
+                        const std::array<float, 16> shadow_rows = make_shadow_rows(ibatch);
+                        std::memcpy(command.pixel_and_shadow + 5u, shadow_rows.data(),
+                                    sizeof(shadow_rows));
                         command.draw.IndexCountPerInstance = ibatch.index_count;
                         command.draw.InstanceCount = 1u;
                         command.draw.StartIndexLocation = ibatch.first_index;
@@ -5835,7 +5853,10 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
                     } else {
                         Dx12IndirectDrawCommand command{};
                         std::memcpy(command.transform, &itransform, sizeof(itransform));
-                        std::memcpy(command.pixel, &ipixel, sizeof(ipixel));
+                        std::memcpy(command.pixel_and_shadow, &ipixel, sizeof(ipixel));
+                        const std::array<float, 16> shadow_rows = make_shadow_rows(ibatch);
+                        std::memcpy(command.pixel_and_shadow + 5u, shadow_rows.data(),
+                                    sizeof(shadow_rows));
                         command.draw.VertexCountPerInstance = ibatch.vertex_count;
                         command.draw.InstanceCount = 1u;
                         command.draw.StartVertexLocation = ibatch.first_vertex;
@@ -5859,10 +5880,12 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
                     account_executed_batch(s, s.batches[j], srv_index, blend_plan);
                 batch_cursor = indirect_end - 1u;
                 cloud_batch_index += indirect_count - 1u;
-                // ExecuteIndirect leaves root constants equal to the last command;
-                // force the scalar cache to repopulate before the next ordinary draw.
+                // ExecuteIndirect leaves all 21 root constants equal to the
+                // last command; force every scalar cache to repopulate before
+                // the next ordinary draw.
                 active_transform_valid = false;
                 active_pixel_valid = false;
+                active_shadow_rows_valid = false;
                 continue;
         }
 

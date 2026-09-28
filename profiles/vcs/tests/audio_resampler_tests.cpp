@@ -98,6 +98,12 @@ void test_output2_master_watermark() {
             "stale Output2 producer incorrectly blocked the host timeline");
     require(vcs::audio_output_master_seal_frame(4096u, 3072u, false, 0u, 3072u) == 3072u,
             "inactive Output2 producer incorrectly changed the host timeline");
+
+    // Recovery uses a deeper reserve than normal startup.  A producer that is
+    // late by more than the normal reserve but still within recovery must keep
+    // its watermark; otherwise a long frame is turned into committed silence.
+    require(vcs::audio_output_master_seal_frame(8192u, 7168u, true, 2560u, 7168u) == 2560u,
+            "recovery-sized Output2 grace did not protect a slow producer");
 }
 
 void test_mono_duplication() {

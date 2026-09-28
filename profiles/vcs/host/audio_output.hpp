@@ -23,14 +23,13 @@ namespace vcs {
 // virtual-time line before they are handed to the native audio device.
 [[nodiscard]] bool audio_output_enabled();
 
-// Mix one PSP buffer into the host stream.  `guest_time_us` is the virtual time
-// at which the PSP submitted the buffer.  Supplying that timestamp is important:
-// it lets simultaneous guest channels land on the same output frames instead of
-// racing one another through an append-only host queue.
+// Mix a buffer at scheduled_time_us on the guest timeline. current_time_us is
+// the actual PSP clock at submission: a blocking call can enqueue a FUTURE
+// buffer, which must not advance/seal the timeline for other channels.
 void audio_output_submit(std::span<const std::int16_t> pcm, std::uint32_t frames,
                          bool stereo, std::uint32_t left, std::uint32_t right,
                          std::uint32_t source_rate, std::uint32_t channel,
-                         std::uint64_t guest_time_us);
+                         std::uint64_t scheduled_time_us, std::uint64_t current_time_us);
 
 // Seal and queue audio whose guest time is safely in the past.  Call this from
 // the vblank path even on frames where the game submitted no new audio so the

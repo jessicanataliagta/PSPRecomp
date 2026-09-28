@@ -1,5 +1,6 @@
 #include "psprecomp/runtime.hpp"
 #include "generated_units.hpp"
+#include "../host/vcs_frame_timing.hpp"
 #include "vcs_resident_regions.hpp"
 #include <bit>
 #include <cmath>
@@ -4341,6 +4342,11 @@ L_08A199DC:
     aot_gpr_4 = (std::bit_cast<std::uint32_t>(aot_fpr_12));
     ctx.set_vfpu_scalar_bits_ct<28u>(aot_gpr_4);
     ctx.execute_vfpu_unary_ct<28u, 28u, 1u, 16u>();
+    // VCS_HIGH_FPS_ROOT_MOTION: cutscene objects also need displacement / dt.
+    // Keep the original VFPU instruction above to consume its prefixes.
+    if (vcs::unlocked_game_timing_enabled())
+        ctx.set_vfpu_scalar_bits_ct<28u>(std::bit_cast<std::uint32_t>(
+            vcs::game_root_motion_scale(aot_fpr_13, 2.0f, true)));
     { const std::uint32_t vfpu_address = ctx.gpr[17] + static_cast<std::uint32_t>(0);
       std::uint32_t vfpu_words[4]{};
       aot_mem.aot_direct_load32_block(vfpu_address, vfpu_words);

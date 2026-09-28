@@ -1,6 +1,7 @@
 #include "psprecomp/runtime.hpp"
 #include "generated_units.hpp"
 #include "vcs_resident_regions.hpp"
+#include "vcs_audio_commands.hpp"
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -6520,6 +6521,10 @@ L_08AABA98:
       goto L_08AABAA0;
     }
 L_08AABAA0:
+    // READY belongs to the current source, not to every future request. A
+    // different cutscene must open its own file, even for a preload request.
+    if (vcs::stream_request_needs_new_source(
+            aot_mem.aot_direct_load32(0x08BD5AE4u), ctx.gpr[17])) goto L_08AABAC4;
     { const bool branch_taken = ctx.gpr[19] != 0u;
       if (branch_taken) {
           goto L_08AABAD8;
@@ -6546,7 +6551,8 @@ L_08AABAC4:
     aot_gpr_4 = (aot_mem.aot_direct_load32(ctx.gpr[28] + static_cast<std::uint32_t>(8356)));
     aot_mem.aot_direct_store32(ctx.gpr[28] + static_cast<std::uint32_t>(-2944), ctx.gpr[16]);
     aot_gpr_31 = (0x08AABAD8u);
-    aot_gpr_5 = (0u | 1u);
+    aot_gpr_5 = vcs::stream_open_event_bits(aot_mem.aot_direct_load32(0x08BD5AE4u), ctx.gpr[17]);
+    vcs::trace_stream_request(aot_mem.aot_direct_load32(0x08BD5AE4u), ctx.gpr[17], aot_gpr_5);
     ctx.pc = 0x08B73424u;
     AOT_REGCACHE_SYNC_OUT(); return;
 L_08AABAD8:

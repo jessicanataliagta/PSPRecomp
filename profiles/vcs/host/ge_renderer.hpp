@@ -127,6 +127,19 @@ struct GePhaseTotals {
     std::uint64_t gpu_accumulate_ns{};  // prepared triangles -> Vulkan frame buffer
     std::uint64_t primitives{};
     std::uint64_t vertices{};
+    // Diagnostic census for the hardware-transform vertex path. These explain
+    // whether vertex_decode_ns is index-stream bookkeeping, CPU conversion, or
+    // draws that could not use the packed 0x0115 DX12 path.
+    std::uint64_t hardware_draws{};
+    std::uint64_t hardware_vertices{};
+    std::uint64_t fast_0115_draws{};
+    std::uint64_t fast_0115_vertices{};
+    std::uint64_t packed_0115_candidates{};
+    std::uint64_t packed_0115_accepted{};
+    std::uint64_t packed_0115_vertices{};
+    std::uint64_t cpu_decode_draws{};
+    std::uint64_t cpu_decode_vertices{};
+    std::uint64_t flat_shaded_draws{};
 };
 [[nodiscard]] GePhaseTotals ge_phase_totals() noexcept;
 void reset_ge_phase_totals() noexcept;

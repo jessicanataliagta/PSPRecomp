@@ -1,6 +1,7 @@
 #include "psprecomp/runtime.hpp"
 #include "generated_units.hpp"
 #include "vcs_resident_regions.hpp"
+#include "../host/vcs_frame_timing.hpp"
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -4198,6 +4199,7 @@ L_08A11340:
     }
     goto L_08A11358;
 L_08A11358:
+    aot_fpr_16 = vcs::game_clock_increment(0u, ctx.gpr[6], aot_fpr_16);
     aot_fpr_16 = std::bit_cast<float>(ctx.fpu_float_to_word_ct<1u>(aot_fpr_16));
     ctx.gpr[7] = (std::bit_cast<std::uint32_t>(aot_fpr_16));
     { const bool branch_taken = 0u == 0u;
@@ -4239,6 +4241,7 @@ L_08A11398:
     }
     goto L_08A113B0;
 L_08A113B0:
+    aot_fpr_12 = vcs::game_clock_increment(1u, aot_gpr_5, aot_fpr_12);
     aot_fpr_12 = std::bit_cast<float>(ctx.fpu_float_to_word_ct<1u>(aot_fpr_12));
     ctx.gpr[6] = (std::bit_cast<std::uint32_t>(aot_fpr_12));
     { const bool branch_taken = 0u == 0u;
@@ -4304,8 +4307,9 @@ L_08A1142C:
       goto L_08A11438;
     }
 L_08A11438:
-    aot_mem.aot_direct_store32(ctx.gpr[28] + static_cast<std::uint32_t>(7676), std::bit_cast<std::uint32_t>(ctx.fpr[20]));
-    aot_fpr_12 = std::bit_cast<float>(std::bit_cast<std::uint32_t>(ctx.fpr[20]));
+    // VCS_HIGH_FPS_TIMESTEP: this local label bypasses runtime overrides.
+    aot_fpr_12 = vcs::game_minimum_timestep(aot_fpr_12, ctx.fpr[20], vcs::unlocked_game_timing_enabled());
+    aot_mem.aot_direct_store32(ctx.gpr[28] + static_cast<std::uint32_t>(7676), std::bit_cast<std::uint32_t>(aot_fpr_12));
     goto L_08A11440;
 L_08A11440:
     aot_mem.aot_direct_store32(ctx.gpr[28] + static_cast<std::uint32_t>(7684), std::bit_cast<std::uint32_t>(aot_fpr_12));

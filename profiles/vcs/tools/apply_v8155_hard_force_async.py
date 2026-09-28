@@ -148,7 +148,7 @@ def check(root: Path) -> None:
         ASYNC_OPT_IN_MARK,
         '_putenv_s("PSPRECOMP_V8151_FORCE_SYNC", "")',
         '_putenv_s("PSPRECOMP_GE_ASYNC", async_opt_in ? "1" : "0")',
-        '_putenv_s("PSPRECOMP_GE_PARALLEL_VERTEX_DECODE", async_opt_in ? "1" : "0")',
+        '_putenv_s("PSPRECOMP_GE_PARALLEL_VERTEX_DECODE", parallel_decode_enabled ? "1" : "0")',
         'v8155 hard_force_async=',
     ]
     for token in required_main:

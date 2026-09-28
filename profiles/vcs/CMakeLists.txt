@@ -383,6 +383,16 @@ if(PSPRECOMP_BUILD_PROFILE_TESTS)
     target_include_directories(audio_resampler_tests PRIVATE host)
     add_test(NAME audio_resampler_tests COMMAND audio_resampler_tests)
 
+    if(WIN32)
+        add_executable(audio_output_timeline_tests tests/audio_output_timeline_tests.cpp)
+        target_include_directories(audio_output_timeline_tests PRIVATE host)
+        add_test(NAME audio_output_timeline_tests COMMAND audio_output_timeline_tests)
+    endif()
+
+    add_executable(vcs_frame_timing_tests tests/vcs_frame_timing_tests.cpp)
+    target_include_directories(vcs_frame_timing_tests PRIVATE host)
+    add_test(NAME vcs_frame_timing_tests COMMAND vcs_frame_timing_tests)
+
     add_executable(vfpu_tier2_tests tests/vfpu_tier2_tests.cpp)
     target_include_directories(vfpu_tier2_tests PRIVATE "${PROJECT_SOURCE_DIR}/include")
     # This differential test instantiates a dense set of header-only VFPU Tier-2

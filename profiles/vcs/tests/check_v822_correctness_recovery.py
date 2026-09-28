@@ -15,10 +15,10 @@ def need(cond, msg):
 
 need('stage=correctness-v8.2.2-recovery-save-audio-news-2026-08-17' in log, 'V8.2.2 runtime stage')
 need('recovery_from_821=1' in log and 'save_lifecycle_v82=1' in log, 'V8.2 lifecycle recovery metadata')
-need('sas_endflag_latched=1' in log and 'sas_loop_history_restore=1' in log, 'SAS correctness metadata')
+need('sas_endflag_live=1' in log and 'sas_loop_history_restore=1' in log, 'SAS correctness metadata')
 need('atrac_virtual_source=1' in log and 'atrac_stall_diag=1' in log, 'ATRAC source metadata')
-need('std::uint32_t end_flags{0xFFFFFFFFu};' in source, 'SAS latched end flags stored')
-need('ctx.set_gpr(2, sas_state.end_flags);' in source, 'GetEndFlag returns latched flags')
+need('std::uint32_t end_flags{0xFFFFFFFFu};' in source, 'SAS checkpoint-compatible flags stored')
+need('sas_refresh_end_flags();\n            ctx.set_gpr(2, sas_state.end_flags);' in source, 'GetEndFlag refreshes current voice flags')
 need(source.count('sas_refresh_end_flags();') >= 2, 'Core paths refresh end flags')
 need('voice.history1 = voice.loop_start_history1;' in source and 'voice.history2 = voice.loop_start_history2;' in source, 'VAG loop predictor restored')
 need('struct SavedataPendingWrite' in source and 'commit_savedata_writes(writes)' in source, 'transactional savedata commit present')

@@ -1,5 +1,6 @@
 #include "psprecomp/runtime.hpp"
 #include "generated_units.hpp"
+#include "../host/vcs_frame_timing.hpp"
 #include "vcs_resident_regions.hpp"
 #include <bit>
 #include <cmath>
@@ -4670,8 +4671,10 @@ L_08919968:
       goto L_0891997C;
     }
 L_0891997C:
-    { const float fs = aot_fpr_12; const float ft = ctx.fpr[26]; if ((std::isinf(fs) && ft == 0.0f) || (std::isinf(ft) && fs == 0.0f)) aot_fpr_12 = std::bit_cast<float>(0x7FC00000u); else aot_fpr_12 = fs * ft; }
-    { const float fs = aot_fpr_13; const float ft = ctx.fpr[26]; if ((std::isinf(fs) && ft == 0.0f) || (std::isinf(ft) && fs == 0.0f)) aot_fpr_13 = std::bit_cast<float>(0x7FC00000u); else aot_fpr_13 = fs * ft; }
+    // VCS_HIGH_FPS_ROOT_MOTION: match CTimer's elapsed-time floor removal.
+    { const float scale = vcs::game_root_motion_scale(aot_fpr_14, ctx.fpr[26], vcs::unlocked_game_timing_enabled());
+      aot_fpr_12 *= scale;
+      aot_fpr_13 *= scale; }
     aot_mem.aot_direct_store32(aot_gpr_16 + static_cast<std::uint32_t>(1940), std::bit_cast<std::uint32_t>(aot_fpr_12));
     aot_mem.aot_direct_store32(aot_gpr_16 + static_cast<std::uint32_t>(1944), std::bit_cast<std::uint32_t>(aot_fpr_13));
     aot_gpr_4 = (aot_mem.aot_direct_load8(ctx.gpr[17] + static_cast<std::uint32_t>(80)));

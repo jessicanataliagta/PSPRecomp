@@ -47,12 +47,12 @@ constexpr std::uint64_t kMixSafetyFrames = 1024u;
 // channel lapping the ring during normal realtime play.
 constexpr std::size_t kRingFrames = kSampleRate * 2u;
 constexpr std::size_t kGuestChannels = 9u;
-constexpr std::size_t kOutput2Channel = 8u;
 constexpr std::uint64_t kChannelDiscontinuityFrames = 64u;
 
 struct Block {
     WAVEHDR header{};
     std::vector<std::int16_t> samples;
+    std::uint64_t start_frame{};
 };
 
 struct ChannelStream {
@@ -81,6 +81,8 @@ struct AudioState {
     std::uint64_t queued_blocks{};
     std::uint64_t underrun_rebuffers{};
     std::uint64_t timeline_resyncs{};
+    std::uint64_t latency_recoveries{};
+    std::uint64_t stale_frames_skipped{};
     std::uint64_t output2_seal_clamps{};
     std::uint64_t submit_calls{};
     std::uint64_t submit_cpu_ns{};
@@ -275,6 +277,7 @@ bool queue_one_block(AudioState &state) {
     }
 
     block.header = WAVEHDR{};
+    block.start_frame = state.output_frame;
     block.header.lpData = reinterpret_cast<LPSTR>(block.samples.data());
     block.header.dwBufferLength = static_cast<DWORD>(block.samples.size() * sizeof(std::int16_t));
     const MMRESULT prepare_result =
@@ -311,8 +314,63 @@ bool queue_one_block(AudioState &state) {
     return true;
 }
 
+// waveOut has no guest timestamps. After a loading stall it will happily play
+// every stale block, permanently delaying speech even after FPS has recovered.
+// Estimate the oldest audible guest frame from the outstanding headers (within
+// one 512-frame block), and discard only the excess beyond our buffering budget.
+bool recover_latency_locked(AudioState &state, std::uint64_t guest_frame) {
+    const std::uint64_t queued_frames = outstanding_blocks(state) * kBlockFrames;
+    const std::uint64_t played_frame = state.output_frame > queued_frames
+        ? state.output_frame - queued_frames : 0u;
+    const std::uint64_t target_delay = state.prebuffer_blocks * kBlockFrames + kMixSafetyFrames;
+    // Hysteresis covers partial headers and normal vblank jitter. It must not
+    // become another reserve added on every underrun.
+    if (guest_frame <= played_frame ||
+        guest_frame - played_frame <= target_delay + 4u * kBlockFrames) return false;
+    const std::uint64_t resume_frame = ((guest_frame - target_delay) / kBlockFrames) * kBlockFrames;
+    if (waveOutReset(state.device) != MMSYSERR_NOERROR) return false;
+    (void)waveOutPause(state.device);
+
+    // Already submitted PCM was removed from the mix ring. Restore the retained
+    // suffix before returning headers, so recovery never replaces valid recent
+    // dialogue with silence or restarts a decoder from sample zero.
+    for (Block &block : state.blocks) {
+        if ((block.header.dwFlags & WHDR_PREPARED) == 0u) continue;
+        for (std::size_t frame = 0u; frame < kBlockFrames; ++frame) {
+            const auto absolute = block.start_frame + frame;
+            if (absolute < resume_frame || absolute >= state.output_frame) continue;
+            const auto slot = static_cast<std::size_t>(absolute % kRingFrames) * kOutputChannels;
+            state.ring[slot] = block.samples[frame * kOutputChannels];
+            state.ring[slot + 1u] = block.samples[frame * kOutputChannels + 1u];
+        }
+    }
+    // Clear any unsubmitted portion of the skipped interval, bounded by the
+    // ring size even after a very long pause. Do not erase future-channel PCM.
+    for (std::uint64_t frame = state.output_frame;
+         frame < resume_frame && frame - state.output_frame < kRingFrames; ++frame) {
+        const auto slot = static_cast<std::size_t>(frame % kRingFrames) * kOutputChannels;
+        state.ring[slot] = state.ring[slot + 1u] = 0;
+    }
+    state.output_frame = resume_frame;
+    // Keep prepared headers allocated. waveOutReset marks them DONE; the normal
+    // queue path unprepares each safely before reusing it.
+    state.playback_started = false;
+    state.recovering_from_underrun = false;
+    ++state.latency_recoveries;
+    state.stale_frames_skipped += resume_frame - played_frame;
+    if (state.diagnostics_log) {
+        state.diagnostics_log << "[audio-recover] guest_frame=" << guest_frame
+            << " old_played_frame=" << played_frame << " resume_frame=" << resume_frame
+            << " skipped_ms=" << (resume_frame - played_frame) * 1000u / kSampleRate << "\n";
+        state.diagnostics_log.flush();
+    }
+    return true;
+}
+
 void advance_locked(AudioState &state, std::uint64_t guest_time_us) {
     if (!state.timeline_anchored || !state.opened) return;
+    const std::uint64_t guest_frame = guest_frame_for(state, guest_time_us);
+    (void)recover_latency_locked(state, guest_frame);
     std::size_t outstanding = outstanding_blocks(state);
     if (state.playback_started) {
         if (outstanding == 0u) {
@@ -322,10 +380,11 @@ void advance_locked(AudioState &state, std::uint64_t guest_time_us) {
             (void)waveOutPause(state.device);
             ++state.underrun_rebuffers;
             state.playback_started = false;
-            state.recovering_from_underrun = true;
+            // A deeper reserve adds permanent A/V latency on every stall.
+            // Recovery uses the same delay budget as initial playback.
+            state.recovering_from_underrun = false;
         }
     }
-    const std::uint64_t guest_frame = guest_frame_for(state, guest_time_us);
     // When only two native blocks remain, waiting another full 23 ms for every
     // PSP channel to contribute is more damaging than sealing the already
     // mixed samples. This emergency margin recovers up to two blocks before an
@@ -335,24 +394,14 @@ void advance_locked(AudioState &state, std::uint64_t guest_time_us) {
     std::uint64_t sealed_frame = guest_frame > safety_frames
         ? guest_frame - safety_frames : 0u;
 
-    // Channel 8 is sceAudioOutput2: VCS' final 44.1-kHz stereo music/radio
-    // mixer.  Do not seal host timeline frames that this producer has not
-    // actually supplied yet.  In heavy scenes virtual_time_us can jump ahead
-    // when the renderer misses wall-clock pace; the old code then committed
-    // zeros to waveOut before Output2 delivered the next 512-frame block.
-    // Once committed those frames cannot be repaired, so spoken NEWS arrived
-    // as a train of missing chunks and sounded dragged/stuttered.
-    //
-    // Keep this bounded: if Output2 really stops for longer than the current
-    // device prebuffer, it stops being the watermark and other PSP channels
-    // are allowed to advance normally.
-    const ChannelStream &output2 = state.channels[kOutput2Channel];
-    const std::uint64_t producer_grace =
-        static_cast<std::uint64_t>(state.prebuffer_blocks) * kBlockFrames;
-    const std::uint64_t unclamped_sealed_frame = sealed_frame;
+    // Preserve the HEAD producer watermark: this prevents sealing silence
+    // before the live Output2 mixer has supplied its samples.
+    const ChannelStream &output2 = state.channels[8u];
+    const std::uint64_t unclamped = sealed_frame;
     sealed_frame = audio_output_master_seal_frame(
-        guest_frame, sealed_frame, output2.active, output2.cursor, producer_grace);
-    if (sealed_frame != unclamped_sealed_frame) ++state.output2_seal_clamps;
+        guest_frame, sealed_frame, output2.active, output2.cursor,
+        state.recovery_prebuffer_blocks * kBlockFrames);
+    if (unclamped != sealed_frame) ++state.output2_seal_clamps;
 
     while (sealed_frame >= state.output_frame + kBlockFrames) {
         if (!queue_one_block(state)) break;
@@ -379,7 +428,7 @@ bool audio_output_enabled() {
 void audio_output_submit(std::span<const std::int16_t> pcm, std::uint32_t frames,
                          bool stereo, std::uint32_t left, std::uint32_t right,
                          std::uint32_t source_rate, std::uint32_t channel,
-                         std::uint64_t guest_time_us) {
+                         std::uint64_t scheduled_time_us, std::uint64_t current_time_us) {
     if (!audio_output_enabled() || frames == 0u || channel >= kGuestChannels) return;
     if (source_rate == 0u) source_rate = kSampleRate;
     const std::size_t needed = static_cast<std::size_t>(frames) * (stereo ? 2u : 1u);
@@ -393,7 +442,7 @@ void audio_output_submit(std::span<const std::int16_t> pcm, std::uint32_t frames
     if (!ensure_device(state)) return;
 
     if (!state.timeline_anchored) {
-        state.guest_anchor_us = guest_time_us;
+        state.guest_anchor_us = current_time_us;
         state.timeline_anchored = true;
         state.output_frame = 0u;
     }
@@ -401,10 +450,10 @@ void audio_output_submit(std::span<const std::int16_t> pcm, std::uint32_t frames
     // Seal old timeline regions before adding the new buffer.  Once virtual
     // time has advanced past them no later PSP thread can legitimately submit
     // audio into those frames.
-    advance_locked(state, guest_time_us);
+    advance_locked(state, current_time_us);
 
     ChannelStream &stream = state.channels[channel];
-    const std::uint64_t scheduled = guest_frame_for(state, guest_time_us);
+    const std::uint64_t scheduled = guest_frame_for(state, scheduled_time_us);
     const auto distance = [](std::uint64_t a, std::uint64_t b) {
         return a > b ? a - b : b - a;
     };
@@ -459,10 +508,10 @@ void audio_output_submit(std::span<const std::int16_t> pcm, std::uint32_t frames
             ++stream.cursor;
         });
 
-    stream.last_guest_time_us = guest_time_us;
+    stream.last_guest_time_us = scheduled_time_us;
     // A submission can make enough older samples complete to fill another
     // device block, so try once more after mixing it.
-    advance_locked(state, guest_time_us);
+    advance_locked(state, current_time_us);
     if (measure_submit) {
         const std::uint64_t submit_ns = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -496,6 +545,12 @@ void audio_output_advance(std::uint64_t guest_time_us) {
              << " underrun_rebuffers=" << state.underrun_rebuffers
              << " resyncs=" << state.timeline_resyncs
              << " output2_clamps=" << state.output2_seal_clamps
+             << " latency_recoveries=" << state.latency_recoveries
+             << " stale_frames_skipped=" << state.stale_frames_skipped
+             << " lag_estimate_ms=" << (guest_frame > state.output_frame
+                 ? (guest_frame - state.output_frame + outstanding * kBlockFrames) * 1000u / kSampleRate
+                 : (outstanding * kBlockFrames > state.output_frame - guest_frame
+                    ? (outstanding * kBlockFrames - (state.output_frame - guest_frame)) * 1000u / kSampleRate : 0u))
              << " late_frames=" << state.late_frames_dropped
              << " overrun_frames=" << state.overrun_frames_dropped
              << " submit_calls=" << state.submit_calls
@@ -552,6 +607,8 @@ void audio_output_shutdown() {
     }
     state.late_frames_dropped = 0u;
     state.overrun_frames_dropped = 0u;
+    state.latency_recoveries = 0u;
+    state.stale_frames_skipped = 0u;
     state.output2_seal_clamps = 0u;
 }
 
@@ -564,7 +621,7 @@ namespace vcs {
 bool audio_output_enabled() { return false; }
 void audio_output_submit(std::span<const std::int16_t>, std::uint32_t, bool,
                          std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
-                         std::uint64_t) {}
+                         std::uint64_t, std::uint64_t) {}
 void audio_output_advance(std::uint64_t) {}
 void audio_output_reset_channel(std::uint32_t) {}
 void audio_output_shutdown() {}

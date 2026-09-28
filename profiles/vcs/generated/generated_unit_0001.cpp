@@ -1,6 +1,7 @@
 #include "psprecomp/runtime.hpp"
 #include "generated_units.hpp"
 #include "vcs_resident_regions.hpp"
+#include "vcs_audio_commands.hpp"
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -7338,6 +7339,12 @@ L_0880A5F4:
     if (([&]() { AOT_REGCACHE_SYNC_OUT(); const bool aot_regcache_same_ = (rt.invoke_chained_direct<&recomp_unit_0216_entry, 216u, 63u, 0x08B64618u>(ctx, &aot_mem)); if (aot_regcache_same_) AOT_REGCACHE_SYNC_IN(); else aot_regcache_valid = false; return aot_regcache_same_; }()) && ctx.pc == 0x0880A5FCu) goto L_0880A5FC;
     AOT_REGCACHE_SYNC_OUT(); return;
 L_0880A5FC:
+    // SAS cannot report a voice that is still in VCS's command queue. Keep
+    // its owner alive until the mixer actually consumes the queued KeyOn.
+    ctx.gpr[2] = vcs::audio_end_flags_with_pending_starts(ctx.gpr[2],
+        aot_mem.aot_direct_load32(0x08BB4780u), aot_mem.aot_direct_load32(0x08BB4784u),
+        aot_mem.aot_direct_load32(0x08BB4AA0u), aot_mem.aot_direct_load32(0x08BB4AA4u),
+        aot_mem.aot_direct_load8(ctx.gpr[28] + static_cast<std::uint32_t>(-32479)) != 0u);
     aot_gpr_4 = (0u | 1u);
     aot_gpr_4 = (aot_gpr_4 << (aot_gpr_16 & 31u));
     aot_gpr_4 = (ctx.gpr[2] & aot_gpr_4);
@@ -7433,6 +7440,10 @@ L_0880A6A4:
     aot_gpr_6 = (ctx.gpr[7] << (aot_gpr_6 & 31u));
     aot_gpr_5 = (aot_gpr_5 | aot_gpr_6);
     aot_mem.aot_direct_store32(aot_gpr_4 + static_cast<std::uint32_t>(8), aot_gpr_5);
+    // A stop newer than an unconsumed start cancels that start. The consumer
+    // executes OFF then ON, so retaining both would restart a stopped loop.
+    aot_mem.aot_direct_store32(aot_gpr_4,
+        vcs::stop_queued_audio_start(aot_mem.aot_direct_load32(aot_gpr_4), aot_gpr_6));
     goto L_0880A6D0;
 L_0880A6D0:
     aot_gpr_31 = (aot_mem.aot_direct_load32(aot_gpr_29 + static_cast<std::uint32_t>(8)));
@@ -8055,6 +8066,11 @@ L_0880AB40:
       goto L_0880AB48;
     }
 L_0880AB48:
+    // A sample-cache miss aborts the batch below. It must not discard stop
+    // commands for the channels that this loop has not visited yet.
+    vcs::finish_aborted_audio_stops(
+        aot_mem.aot_direct_load32(0x08BB4AA8u),
+        aot_mem.aot_direct_load32(0x08BB4AACu), ctx.gpr[20]);
     { const bool branch_taken = 0u == 0u;
     aot_mem.aot_direct_store8(ctx.gpr[28] + static_cast<std::uint32_t>(-32479), static_cast<std::uint8_t>(0u));
       if (branch_taken) {
@@ -8475,6 +8491,14 @@ L_0880AE88:
     if (([&]() { AOT_REGCACHE_SYNC_OUT(); const bool aot_regcache_same_ = (rt.invoke_chained_direct<&recomp_unit_0216_entry, 216u, 41u, 0x08B64424u>(ctx, &aot_mem)); if (aot_regcache_same_) AOT_REGCACHE_SYNC_IN(); else aot_regcache_valid = false; return aot_regcache_same_; }()) && ctx.pc == 0x0880AE90u) goto L_0880AE90;
     AOT_REGCACHE_SYNC_OUT(); return;
 L_0880AE90:
+    // This channel has been visited. Do not report its old start request as
+    // still pending while the audio thread works on the rest of the batch.
+    {
+        const auto word = ctx.gpr[20] < 24u ? 0x08BB4AA0u : 0x08BB4AA4u;
+        const auto bit = 1u << (ctx.gpr[20] < 24u ? ctx.gpr[20] : ctx.gpr[20] - 24u);
+        aot_mem.aot_direct_store32(word, vcs::cancel_pending_audio_start(
+            aot_mem.aot_direct_load32(word), bit));
+    }
     aot_gpr_4 = (aot_mem.aot_direct_load32(aot_gpr_29 + static_cast<std::uint32_t>(32)));
     ctx.gpr[20] = (ctx.gpr[21] | 0u);
     aot_gpr_4 = (aot_gpr_4 + static_cast<std::uint32_t>(4));

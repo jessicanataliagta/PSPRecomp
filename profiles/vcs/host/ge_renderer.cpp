@@ -161,6 +161,16 @@ std::uint64_t g_ge_triangle_prep_ns{};
 std::uint64_t g_ge_gpu_accumulate_ns{};
 std::uint64_t g_ge_primitive_count{};
 std::uint64_t g_ge_vertex_count{};
+std::uint64_t g_ge_hardware_draws{};
+std::uint64_t g_ge_hardware_vertices{};
+std::uint64_t g_ge_fast_0115_draws{};
+std::uint64_t g_ge_fast_0115_vertices{};
+std::uint64_t g_ge_packed_0115_candidates{};
+std::uint64_t g_ge_packed_0115_accepted{};
+std::uint64_t g_ge_packed_0115_vertices{};
+std::uint64_t g_ge_cpu_decode_draws{};
+std::uint64_t g_ge_cpu_decode_vertices{};
+std::uint64_t g_ge_flat_shaded_draws{};
 
 // Accumulates into `sink` only when the phase diagnostic is enabled, so the
 // production path pays one predictable branch and no clock read.
@@ -4575,6 +4585,15 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
         }
         const bool cpu_lighting_effective = hw_lighting_on_cpu && !gpu_directional_lighting;
         const bool flat_shading = (data24(commands[0x50u]) & 1u) == 0u;
+        if (ge_phase_diag_enabled()) {
+            ++g_ge_hardware_draws;
+            g_ge_hardware_vertices += decode_count;
+            if (fast_0115_raw != nullptr) {
+                ++g_ge_fast_0115_draws;
+                g_ge_fast_0115_vertices += decode_count;
+            }
+            if (flat_shading) ++g_ge_flat_shaded_draws;
+        }
         GeGpuHardwareTransform hw =
             build_gpu_hardware_transform(commands, transform, cpu_lighting_effective,
                                          uv_generation == 1u || uv_generation == 2u);
@@ -4600,6 +4619,7 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
             !gpu_force_white_vertex_colors_enabled() && !gpu_geometry_debug_colors_enabled() &&
             (!effective_draw.texture_enabled || sampled_texture_ready);
         if (packed_0115_candidate) {
+            if (ge_phase_diag_enabled()) ++g_ge_packed_0115_candidates;
             const auto occurrence_index = [&](std::size_t i) -> std::uint32_t {
                 if (!indexed) return static_cast<std::uint32_t>(i);
                 if (contiguous_decode) return occurrence_indices[i] - contiguous_first;
@@ -4659,6 +4679,10 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
                     static_cast<std::uint32_t>(decode_count), triangle_indices);
             }
             if (accepted) {
+                if (ge_phase_diag_enabled()) {
+                    ++g_ge_packed_0115_accepted;
+                    g_ge_packed_0115_vertices += decode_count;
+                }
                 if (collect_diagnostic_stats) stats.decoded_vertices += decode_count;
                 if (collect_diagnostic_stats) stats.triangles += packed_triangle_count;
                 advance_stream();
@@ -4669,6 +4693,10 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
 
         // Fallback for lit/skinned/morphed/sparse/debug draws and for any backend
         // that does not implement the packed 0x0115 stream.
+        if (ge_phase_diag_enabled()) {
+            ++g_ge_cpu_decode_draws;
+            g_ge_cpu_decode_vertices += decode_count;
+        }
         decoded_vertices.resize(decode_count);
         {
         PhaseTimer vertex_timer(g_ge_vertex_decode_ns);
@@ -5094,6 +5122,11 @@ GePhaseTotals ge_phase_totals() noexcept {
         g_ge_draw_setup_ns, g_ge_texture_upload_ns, g_ge_vertex_decode_ns,
         g_ge_gpu_stage_ns, g_ge_triangle_prep_ns, g_ge_gpu_accumulate_ns,
         g_ge_primitive_count, g_ge_vertex_count,
+        g_ge_hardware_draws, g_ge_hardware_vertices,
+        g_ge_fast_0115_draws, g_ge_fast_0115_vertices,
+        g_ge_packed_0115_candidates, g_ge_packed_0115_accepted,
+        g_ge_packed_0115_vertices, g_ge_cpu_decode_draws,
+        g_ge_cpu_decode_vertices, g_ge_flat_shaded_draws,
     };
 }
 
@@ -5108,6 +5141,16 @@ void reset_ge_phase_totals() noexcept {
     g_ge_gpu_accumulate_ns = 0u;
     g_ge_primitive_count = 0u;
     g_ge_vertex_count = 0u;
+    g_ge_hardware_draws = 0u;
+    g_ge_hardware_vertices = 0u;
+    g_ge_fast_0115_draws = 0u;
+    g_ge_fast_0115_vertices = 0u;
+    g_ge_packed_0115_candidates = 0u;
+    g_ge_packed_0115_accepted = 0u;
+    g_ge_packed_0115_vertices = 0u;
+    g_ge_cpu_decode_draws = 0u;
+    g_ge_cpu_decode_vertices = 0u;
+    g_ge_flat_shaded_draws = 0u;
 }
 
 } // namespace vcs

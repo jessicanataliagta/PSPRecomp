@@ -800,7 +800,8 @@ int main() {
         test_ge_cull_face_state();
         test_ge_flat_shading_provoking_vertex();
         std::string error;
-        require(vcs::run_profile_self_tests(error), error.empty() ? "VCS profile self-test failed" : error.c_str());
+        const bool profile_ok = vcs::run_profile_self_tests(error);
+        require(profile_ok, error.empty() ? "VCS profile self-test failed" : error.c_str());
         std::cout << "All VCS scheduler/callback/framebuffer tests passed.\n";
         return 0;
     } catch (const std::exception &exception) {

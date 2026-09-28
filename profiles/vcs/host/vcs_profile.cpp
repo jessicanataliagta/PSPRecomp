@@ -1,4 +1,5 @@
 #include "vcs_profile.hpp"
+#include "vcs_audio_commands.hpp"
 #include "vcs_native_fast_paths.hpp"
 #include "audio_output.hpp"
 #include "display_window.hpp"
@@ -6,6 +7,7 @@
 #include "vcs_vehicle_input.hpp"
 #include "vcs_media_decoder.hpp"
 #include "vcs_config.hpp"
+#include "vcs_frame_timing.hpp"
 #include "framebuffer_capture.hpp"
 #include "ge_renderer.hpp"
 #include "ge_gpu_backend.hpp"
@@ -1742,14 +1744,26 @@ struct SasState {
     std::uint32_t output_mode{};
     std::uint32_t sample_rate{44100u};
     std::array<SasVoiceState, 32> voices{};
-    // sceSasGetEndFlag exposes a hardware-latched snapshot. The flags are
-    // refreshed by a completed __sceSasCore/__sceSasCoreWithMix cycle, not by
-    // arbitrary setters in the middle of a grain.
+    // Cached for checkpoint compatibility, but GetEndFlag refreshes this from
+    // current voice state too: a KeyOn must not still report the previous EOF.
     std::uint32_t end_flags{0xFFFFFFFFu};
     SasReverbState reverb{};
 };
 
 SasState sas_state{};
+std::uint64_t sas_key_on_calls{}, sas_key_off_calls{}, sas_key_on_rejected{}, sas_key_off_rejected{};
+std::uint64_t sas_abort_batches{}, sas_abort_stops{};
+
+bool sas_key_off(SasVoiceState &voice) noexcept {
+    ++sas_key_off_calls;
+    if (voice.paused || !voice.on) {
+        ++sas_key_off_rejected;
+        return false;
+    }
+    voice.on = false;
+    voice.envelope_phase = SasEnvelopePhase::Release;
+    return true;
+}
 std::uint64_t sas_core_mix_calls{};
 std::uint64_t sas_core_with_mix_calls{};
 
@@ -1774,6 +1788,32 @@ void sas_refresh_end_flags() noexcept {
 }
 
 void sas_log_mix_checkpoint(const char *kind, std::uint64_t count) {
+    static std::uint64_t last_summary_us{};
+    if (vcs_configuration().audio.diagnostics &&
+        (virtual_time_us < last_summary_us || virtual_time_us - last_summary_us >= 1'000'000u)) {
+        last_summary_us = virtual_time_us;
+        std::uint32_t playing{}, on{}, paused{}, releasing{}, loops{};
+        for (std::size_t i = 0; i < sas_state.voices.size(); ++i) {
+            const auto &v = sas_state.voices[i];
+            const auto bit = 1u << i;
+            if (v.playing) playing |= bit;
+            if (v.on) on |= bit;
+            if (v.paused) paused |= bit;
+            if (v.playing && v.loop) loops |= bit;
+            if (v.playing && v.envelope_phase == SasEnvelopePhase::Release) releasing |= bit;
+        }
+        std::ostringstream line;
+        line << "SAS_LIFECYCLE guest_us=" << virtual_time_us
+             << " playing=" << psprecomp::hex32(playing) << " on=" << psprecomp::hex32(on)
+             << " paused=" << psprecomp::hex32(paused) << " release=" << psprecomp::hex32(releasing)
+             << " loops=" << psprecomp::hex32(loops) << " keyon=" << sas_key_on_calls
+             << " keyoff=" << sas_key_off_calls << " rejected_on=" << sas_key_on_rejected
+             << " rejected_off=" << sas_key_off_rejected << " aborted_batches=" << sas_abort_batches
+             << " recovered_stops=" << sas_abort_stops
+             << " cancelled_starts=" << audio_pending_start_cancellations
+             << " pending_owner_guards=" << audio_pending_owner_protections;
+        runtime_log_line(line.str());
+    }
     if (!sas_audio_diagnostics_enabled()) return;
     if (count <= 8u || (count % 256u) == 0u) {
         std::cerr << "[sas] " << kind << " call=" << count
@@ -1907,6 +1947,7 @@ std::uint32_t sas_step_envelope(SasVoiceState &voice) noexcept {
             voice.envelope_height = 0u;
             voice.envelope_phase = SasEnvelopePhase::Off;
             voice.playing = false;
+            voice.on = false;
         } else {
             voice.envelope_height -= kSasFallbackReleaseStep;
         }
@@ -1965,11 +2006,13 @@ std::uint32_t sas_step_envelope(SasVoiceState &voice) noexcept {
             height = 0;
             voice.envelope_phase = SasEnvelopePhase::Off;
             voice.playing = false;
+            voice.on = false;
         }
         break;
     case SasEnvelopePhase::Off:
         height = 0;
         voice.playing = false;
+        voice.on = false;
         break;
     }
 
@@ -2208,13 +2251,17 @@ void sas_render_voice(const psprecomp::GuestMemory &memory, SasVoiceState &voice
 
     for (std::uint32_t frame = 0u; frame < frames && voice.playing; ++frame) {
         const std::uint32_t envelope = sas_step_envelope(voice);
-        if (!voice.playing || envelope == 0u) continue;
+        if (!voice.playing) break;
 
         std::int32_t sample = 0;
         if (voice.type == SasVoiceType::Vag)
             sample = sas_render_vag_sample(memory, voice);
         else if (voice.type == SasVoiceType::Noise)
             sample = sas_render_noise_sample(voice);
+
+        // Gain must not gate the source clock. Silent attacks/sustains still
+        // consume samples and reach EOF, just like an audible voice.
+        if (envelope == 0u) continue;
 
         const auto accumulate = [&](std::vector<std::int32_t> &target,
                                     std::int32_t left_volume,
@@ -7130,6 +7177,34 @@ void vcs_interrupt_return(psprecomp::Runtime &runtime, psprecomp::AllegrexContex
 }
 }
 
+bool unlocked_game_timing_enabled() noexcept {
+    return configured_game_frame_rate() > 30u;
+}
+
+void trace_stream_request(std::uint32_t current, std::uint32_t requested, std::uint32_t events) {
+    if (!vcs_configuration().audio.diagnostics) return;
+    std::ostringstream line;
+    line << "STREAM_REQUEST guest_us=" << virtual_time_us << " current=" << current
+         << " requested=" << requested << " events=" << events;
+    runtime_log_line(line.str());
+}
+
+float game_clock_increment(unsigned clock, std::uint32_t current, float milliseconds) noexcept {
+    static std::array<FractionalGameClock, 2> clocks{};
+    return clocks[clock & 1u].increment(current, milliseconds, unlocked_game_timing_enabled());
+}
+
+void finish_aborted_audio_stops(std::uint32_t low, std::uint32_t high,
+                                std::uint32_t failed_channel) {
+    ++sas_abort_batches;
+    if (!sas_state.initialized) return;
+    const auto mask = remaining_audio_stops(low, high, failed_channel);
+    for (std::uint32_t i = 0; i < 28u; ++i) {
+        if ((mask & (1u << i)) != 0u && sas_key_off(sas_state.voices[i]))
+            ++sas_abort_stops;
+    }
+}
+
 const char *thread_state_name(ThreadState state) {
     switch (state) {
     case ThreadState::Created: return "Created";
@@ -7242,6 +7317,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
     }
     std::cerr << "[frame-rate] target=" << configured_game_frame_rate()
               << " virtual_display=" << virtual_display_refresh_hz() << " Hz\n";
+    runtime_log_line("AUDIO_TIMING_REVISION=6 live_sas_end_flags=1 unlocked_timestep=1 root_motion_scale=1 sas_silent_clock=1 abort_stop_drain=1 ordered_audio_commands=1 pending_voice_ownership=1 fractional_game_clocks=1 stream_source_transition=1");
     file_table = FileTable{};
     for (auto &[address, state] : mpeg_contexts) close_video_decoder(state);
     mpeg_contexts.clear();
@@ -8927,6 +9003,28 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         // Keep CPU/GE overlap alive through callbacks/telemetry and acquire the
         // renderer safe-point only immediately around frame finalization below.
         ++display_vblank_index;
+        if ((vcs_configuration().audio.diagnostics || std::getenv("PSPRECOMP_GAME_TIMING_DIAG") != nullptr) &&
+            rt.memory().contains(ctx.gpr[28] + 7660u, 108u)) {
+            static std::uint32_t previous_frame = 0u;
+            static std::uint64_t next_report = 0u;
+            static double animation_ms = 0.0;
+            const auto gp = ctx.gpr[28];
+            const auto frame = rt.memory().load32(gp + 7764u);
+            const float timestep = std::bit_cast<float>(rt.memory().load32(gp + 7676u));
+            if (frame != previous_frame) {
+                animation_ms += timestep * 20.0;
+                previous_frame = frame;
+            }
+            if (virtual_time_us >= next_report) {
+                std::ostringstream line;
+                line << "GAME_TIMELINE guest_us=" << virtual_time_us
+                     << " frame=" << frame << " timestep=" << timestep
+                     << " animation_ms=" << animation_ms
+                     << " game_ms=" << rt.memory().load32(gp + 7660u);
+                runtime_log_line(line.str());
+                next_report = virtual_time_us + 1000000u;
+            }
+        }
         // First-boot frontend + native pause-menu mouse state.  TITLES.PMF
         // completion is signalled directly by the MPEG HLE, so this vblank path
         // never guesses intro completion from framebuffer timing and never
@@ -9074,7 +9172,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                             runtime_log_line(tier2_line.str());
                         }
 #endif
-                        if (vcs_configuration().diagnostics.guest_hotspot_profile &&
+                        if (psprecomp::g_guest_hotspot_profile_enabled &&
                             ++guest_hotspot_perf_windows >= 5u) {
                             report_guest_hotspot_window(display_vblank_index);
                             guest_hotspot_perf_windows = 0u;
@@ -9120,7 +9218,86 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                                << " list_us=" << (ge_us > accounted ? ge_us - accounted : 0)
                                << " ge_commands=" << ge_commands_this_vblank
                                << "\n";
-                    write_diag_line(phase_line);
+                    // PERF telemetry already preserves a 60-vblank aggregate
+                    // below. Avoid the per-frame stderr write in that mode: on
+                    // Windows the console flush itself measurably distorts the
+                    // frame whose phases are being measured.
+                    if (!perf_telemetry_enabled()) write_diag_line(phase_line);
+
+                    // The console line above is useful while profiling, but it
+                    // disappears when bench.bat closes. Preserve a low-volume
+                    // 60-vblank aggregate in VCSNative.log so a completed run
+                    // can be analysed after the fact without logging every
+                    // frame through the runtime-log mutex.
+                    static vcs::GePhaseTotals phase_window{};
+                    static std::uint64_t phase_window_frames{};
+                    static std::uint64_t phase_window_ge_us{};
+                    static std::uint64_t phase_window_list_us{};
+                    static std::uint64_t phase_window_commands{};
+                    phase_window.pixel_loop_ns += phases.pixel_loop_ns;
+                    phase_window.triangles += phases.triangles;
+                    phase_window.draw_setup_ns += phases.draw_setup_ns;
+                    phase_window.texture_upload_ns += phases.texture_upload_ns;
+                    phase_window.vertex_decode_ns += phases.vertex_decode_ns;
+                    phase_window.gpu_stage_ns += phases.gpu_stage_ns;
+                    phase_window.triangle_prep_ns += phases.triangle_prep_ns;
+                    phase_window.gpu_accumulate_ns += phases.gpu_accumulate_ns;
+                    phase_window.primitives += phases.primitives;
+                    phase_window.vertices += phases.vertices;
+                    phase_window.hardware_draws += phases.hardware_draws;
+                    phase_window.hardware_vertices += phases.hardware_vertices;
+                    phase_window.fast_0115_draws += phases.fast_0115_draws;
+                    phase_window.fast_0115_vertices += phases.fast_0115_vertices;
+                    phase_window.packed_0115_candidates += phases.packed_0115_candidates;
+                    phase_window.packed_0115_accepted += phases.packed_0115_accepted;
+                    phase_window.packed_0115_vertices += phases.packed_0115_vertices;
+                    phase_window.cpu_decode_draws += phases.cpu_decode_draws;
+                    phase_window.cpu_decode_vertices += phases.cpu_decode_vertices;
+                    phase_window.flat_shaded_draws += phases.flat_shaded_draws;
+                    phase_window_ge_us += static_cast<std::uint64_t>(
+                        std::max<std::int64_t>(0, ge_us));
+                    phase_window_list_us += static_cast<std::uint64_t>(
+                        std::max<std::int64_t>(0, ge_us - accounted));
+                    phase_window_commands += ge_commands_this_vblank;
+                    ++phase_window_frames;
+                    if (phase_window_frames >= perf_telemetry_interval()) {
+                        const std::uint64_t n = phase_window_frames;
+                        const auto avg_us = [n](std::uint64_t ns) {
+                            return ns / (1000u * n);
+                        };
+                        std::ostringstream aggregate_line;
+                        aggregate_line << "GE_PHASE window=" << n
+                                       << " vblank=" << display_vblank_index
+                                       << " ge_us_avg=" << (phase_window_ge_us / n)
+                                       << " pixel_us_avg=" << avg_us(phase_window.pixel_loop_ns)
+                                       << " setup_us_avg=" << avg_us(phase_window.draw_setup_ns)
+                                       << " texupload_us_avg=" << avg_us(phase_window.texture_upload_ns)
+                                       << " vdecode_us_avg=" << avg_us(phase_window.vertex_decode_ns)
+                                       << " stage_us_avg=" << avg_us(phase_window.gpu_stage_ns)
+                                       << " triprep_us_avg=" << avg_us(phase_window.triangle_prep_ns)
+                                       << " accum_us_avg=" << avg_us(phase_window.gpu_accumulate_ns)
+                                       << " list_us_avg=" << (phase_window_list_us / n)
+                                       << " triangles=" << phase_window.triangles
+                                       << " draws=" << phase_window.primitives
+                                       << " verts=" << phase_window.vertices
+                                       << " hw_draws=" << phase_window.hardware_draws
+                                       << " hw_verts=" << phase_window.hardware_vertices
+                                       << " fast0115_draws=" << phase_window.fast_0115_draws
+                                       << " fast0115_verts=" << phase_window.fast_0115_vertices
+                                       << " packed_candidates=" << phase_window.packed_0115_candidates
+                                       << " packed_accepted=" << phase_window.packed_0115_accepted
+                                       << " packed_verts=" << phase_window.packed_0115_vertices
+                                       << " cpu_decode_draws=" << phase_window.cpu_decode_draws
+                                       << " cpu_decode_verts=" << phase_window.cpu_decode_vertices
+                                       << " flat_draws=" << phase_window.flat_shaded_draws
+                                       << " ge_commands=" << phase_window_commands;
+                        runtime_log_line(aggregate_line.str());
+                        phase_window = {};
+                        phase_window_frames = 0u;
+                        phase_window_ge_us = 0u;
+                        phase_window_list_us = 0u;
+                        phase_window_commands = 0u;
+                    }
                     ge_commands_this_vblank = 0u;
                     vcs::reset_ge_phase_totals();
                 }
@@ -9558,7 +9735,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                         static_cast<std::uint32_t>(index * sizeof(std::int16_t))));
             }
             vcs::audio_output_submit(pcm, state.sample_count, channels == 2u, left, right,
-                                     state.frequency, channel, start_us);
+                                     state.frequency, channel, start_us, virtual_time_us);
         }
         // A blocking submission returns when the *previous* buffer finished,
         // which is exactly when this one starts.
@@ -9682,7 +9859,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                             static_cast<std::uint32_t>(index * sizeof(std::int16_t))));
                 }
                 vcs::audio_output_submit(pcm, state.sample_count, true,
-                                         volume, volume, state.frequency, 8u, start_us);
+                                         volume, volume, state.frequency, 8u, start_us, virtual_time_us);
             }
             const std::uint64_t wait_us =
                 start_us > virtual_time_us ? start_us - virtual_time_us : 0u;
@@ -9753,6 +9930,13 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             state.next_file_offset = std::min(read_size, parsed.file_size);
             state.write_offset = buffer_size == 0u ? 0u : read_size % buffer_size;
             state.source_path = identify_atrac_source(buffer, header_bytes, parsed);
+            if (vcs_configuration().audio.diagnostics) {
+                std::ostringstream line;
+                line << "ATRAC_LIFECYCLE event=create id=" << id << " guest_us=" << virtual_time_us
+                     << " buffer=" << psprecomp::hex32(buffer)
+                     << " source=" << state.source_path.filename().string();
+                runtime_log_line(line.str());
+            }
             if (!state.source_path.empty()) {
                 const std::string source_name = state.source_path.filename().string();
                 if (source_name.rfind("NEWS_", 0u) == 0u) {
@@ -9784,6 +9968,13 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         [get_atrac](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
             auto *state = get_atrac(ctx.gpr[4]);
             if (!state) { ctx.set_gpr(2, kAtracErrorBadId); return; }
+            if (vcs_configuration().audio.diagnostics) {
+                std::ostringstream line;
+                line << "ATRAC_LIFECYCLE event=release id=" << ctx.gpr[4]
+                     << " guest_us=" << virtual_time_us << " sample=" << state->sample_position
+                     << " source=" << state->source_path.filename().string();
+                runtime_log_line(line.str());
+            }
             close_atrac_decoder(*state);
             *state = AtracContextState{};
             set_success(ctx);
@@ -9941,6 +10132,20 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             got = static_cast<std::size_t>(samples) * bytes_per_sample;
             if (output != 0u && got != 0u) rt.memory().copy_in(output, std::span<const std::uint8_t>(pcm.data(), got));
             state->sample_position += samples;
+            // Low-rate source-clock evidence, independent of display FPS. In
+            // particular this distinguishes a slow producer from a late sink.
+            if (samples != 0u && state->header.sample_rate != 0u &&
+                (state->sample_position == samples ||
+                 state->sample_position / state->header.sample_rate !=
+                     (state->sample_position - samples) / state->header.sample_rate)) {
+                std::ostringstream line;
+                line << "ATRAC_TIMELINE source=" << state->source_path.filename().string()
+                     << " id=" << ctx.gpr[4]
+                     << " guest_us=" << virtual_time_us
+                     << " sample=" << state->sample_position
+                     << " rate=" << state->header.sample_rate;
+                runtime_log_line(line.str());
+            }
             if (samples != 0u && state->header.block_align != 0u) {
                 if (state->buffered_encoded_bytes >= state->header.block_align)
                     state->buffered_encoded_bytes -= state->header.block_align;
@@ -10064,6 +10269,13 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
             auto *state = get_atrac(ctx.gpr[4]);
             if (!state) { ctx.set_gpr(2, kAtracErrorBadId); return; }
             const std::uint32_t sample = std::min(ctx.gpr[5], state->header.total_samples);
+            if (vcs_configuration().audio.diagnostics) {
+                std::ostringstream line;
+                line << "ATRAC_LIFECYCLE event=seek id=" << ctx.gpr[4] << " guest_us=" << virtual_time_us
+                     << " old_sample=" << state->sample_position << " sample=" << sample
+                     << " source=" << state->source_path.filename().string();
+                runtime_log_line(line.str());
+            }
             const std::uint32_t bytes_first = ctx.gpr[6];
             const std::uint32_t frame = sample / atrac_samples_per_frame(*state);
             const std::uint64_t pos64 = static_cast<std::uint64_t>(state->header.data_offset) +
@@ -10136,11 +10348,20 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 // PSP ignores an invalid VAG pointer, leaving the voice configured.
                 set_success(ctx); return;
             }
+            // Games are allowed to repeat SetVoice while a voice is active.
+            // This updates metadata; it is not a retrigger.  Rewinding on every
+            // identical call makes continuously-maintained vehicle voices play
+            // the first VAG block over and over and can sound like an eternal
+            // loop.  Only a genuinely different source configuration starts a
+            // new decoder stream; KeyOn remains the explicit retrigger path.
+            const bool source_changed = voice->type != SasVoiceType::Vag ||
+                voice->data_address != address || voice->data_size != size ||
+                voice->loop != (loop != 0);
             voice->type = SasVoiceType::Vag;
             voice->data_address = address;
             voice->data_size = size;
             voice->loop = loop != 0;
-            sas_reset_decoder(*voice);
+            if (source_changed) sas_reset_decoder(*voice);
             if (voice->on) voice->playing = true;
             set_success(ctx);
         });
@@ -10264,7 +10485,9 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
             auto *voice = sas_voice(ctx.gpr[4], static_cast<std::int32_t>(ctx.gpr[5]), ctx);
             if (!voice) return;
+            ++sas_key_on_calls;
             if (voice->paused || voice->on) {
+                ++sas_key_on_rejected;
                 ctx.set_gpr(2, kSasErrorVoicePaused); return;
             }
             sas_reset_decoder(*voice);
@@ -10286,15 +10509,9 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
             auto *voice = sas_voice(ctx.gpr[4], static_cast<std::int32_t>(ctx.gpr[5]), ctx);
             if (!voice) return;
-            if (voice->paused || !voice->on) {
+            if (!sas_key_off(*voice)) {
                 ctx.set_gpr(2, kSasErrorVoicePaused); return;
             }
-            voice->on = false;
-            voice->envelope_phase = SasEnvelopePhase::Release;
-            // A release rate of zero never walks the envelope down, so a looping
-            // voice keyed off here would sound forever.  Log it: this is the
-            // remaining suspect for the vehicle engine that keeps running under
-            // the pause menu.
             if (sas_audio_diagnostics_enabled())
                 std::cerr << "[sas] keyoff voice=" << static_cast<std::int32_t>(ctx.gpr[5])
                           << " loop=" << voice->loop
@@ -10326,6 +10543,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
     runtime.register_hle("sceSasCore", 0x68A46B95u,
         [](psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
             if (!sas_valid_core(ctx.gpr[4])) { ctx.set_gpr(2, kSasErrorNotInitialized); return; }
+            sas_refresh_end_flags();
             ctx.set_gpr(2, sas_state.end_flags);
         });
 
@@ -12048,9 +12266,83 @@ bool run_profile_self_tests(std::string &error) {
                     "zero-rate KeyOff left a looping SAS voice alive forever");
         }
 
-        // End flags are a post-Core snapshot. Setters may change a voice in the
-        // middle of a grain, but GetEndFlag must not expose that transition until
-        // the next completed mixer cycle refreshes the hardware-visible flags.
+        // Envelope completion must release the key latch too. Otherwise a
+        // naturally decaying loop reports EOF but rejects its next KeyOn, and
+        // SetVoice can resurrect it through the stale `on` flag.
+        {
+            SasVoiceState voice{};
+            voice.type = SasVoiceType::Vag;
+            voice.loop = true;
+            voice.playing = voice.on = true;
+            voice.adsr_configured = true;
+            voice.envelope_height = 1u;
+            voice.envelope_phase = SasEnvelopePhase::Sustain;
+            voice.adsr_rates[2] = voice.adsr_rates[3] = 1;
+            sas_step_envelope(voice);
+            sas_step_envelope(voice);
+            require(!voice.playing && !voice.on,
+                    "completed SAS envelope retained its KeyOn latch");
+        }
+
+        // Replay a sample-cache failure at every point in the 28-channel
+        // command batch. Unvisited KeyOff commands must still reach SAS;
+        // unrelated/earlier channels and paused voices retain PSP semantics.
+        {
+            const SasState previous = sas_state;
+            for (std::uint32_t failed = 0; failed < 28u; ++failed) {
+                sas_state = SasState{};
+                sas_state.initialized = true;
+                for (auto &voice : sas_state.voices) {
+                    voice.playing = voice.on = voice.loop = true;
+                    voice.envelope_height = kSasEnvelopeMaximum;
+                }
+                constexpr auto low = 0x008082A5u;
+                constexpr auto high = 0xFFFFFFF9u; // only the low 4 bits are channels
+                finish_aborted_audio_stops(low, high, failed);
+                for (std::uint32_t i = 0; i < 32u; ++i) {
+                    const bool stop = i < 28u && i > failed &&
+                        (i < 24u ? ((low >> i) & 1u) : ((high >> (i - 24u)) & 1u));
+                    auto &voice = sas_state.voices[i];
+                    require(voice.on != stop, "aborted VCS batch lost or invented a KeyOff");
+                    for (unsigned sample = 0; sample < kSasFallbackReleaseSamples; ++sample)
+                        sas_step_envelope(voice);
+                    require(voice.playing != stop, "aborted VCS batch left a stopped loop playing");
+                }
+            }
+            sas_state.voices[27].paused = true;
+            sas_state.voices[27].on = true;
+            finish_aborted_audio_stops(0u, 8u, 0u);
+            require(sas_state.voices[27].on, "abort drain bypassed SAS paused KeyOff semantics");
+            require(remaining_audio_stops(~0u, ~0u, 32u) == 0u,
+                    "invalid abort channel produced stop commands");
+            sas_state = previous;
+        }
+
+        // A silent envelope changes gain, not the source clock. Even an
+        // attack with rate zero must consume a finite VAG and reach EOF.
+        {
+            psprecomp::Runtime silent_runtime;
+            constexpr std::uint32_t vag = 0x08806000u;
+            silent_runtime.memory().zero(vag, 16u);
+            silent_runtime.memory().store8(vag + 1u, 1u);
+            SasVoiceState voice{};
+            voice.type = SasVoiceType::Vag;
+            voice.data_address = vag;
+            voice.data_size = 16;
+            voice.playing = voice.on = true;
+            voice.adsr_configured = true;
+            voice.envelope_phase = SasEnvelopePhase::Attack;
+            voice.adsr_rates[0] = 0;
+            std::vector<std::int32_t> dry(128u), wet(128u);
+            sas_render_voice(silent_runtime.memory(), voice, dry, wet, 64u);
+            require(!voice.playing && !voice.on,
+                    "silent SAS envelope froze the finite source at its beginning");
+            require(std::all_of(dry.begin(), dry.end(), [](auto v) { return v == 0; }),
+                    "silent SAS envelope leaked samples");
+        }
+
+        // Refreshing the cached flags must include both voice transitions.
+        // The HLE tests below also exercise KeyOn/GetEndFlag without a Core.
         {
             const SasState previous = sas_state;
             sas_state = SasState{};
@@ -12827,8 +13119,8 @@ bool run_profile_self_tests(std::string &error) {
             sas_context = {};
             sas_context.set_gpr(4u, sas_core);
             wlan_runtime.invoke_import("sceSasCore", 0x68A46B95u, sas_context);
-            require((sas_context.gpr[2] & 1u) != 0u,
-                    "SAS end flag changed before the first Core refresh");
+            require((sas_context.gpr[2] & 1u) == 0u,
+                    "SAS KeyOn still reports EOF before the first Core");
 
             wlan_runtime.memory().zero(sas_output, 0x400u);
             sas_context = {};
@@ -12846,6 +13138,13 @@ bool run_profile_self_tests(std::string &error) {
             // This catches the old bug where a reused gunshot/footstep resumed at
             // EOF and therefore vanished after its first play.
             key_on_voice0();
+            for (unsigned poll = 0; poll < 8u; ++poll) {
+                sas_context = {};
+                sas_context.set_gpr(4u, sas_core);
+                wlan_runtime.invoke_import("sceSasCore", 0x68A46B95u, sas_context);
+                require((sas_context.gpr[2] & 1u) == 0u,
+                        "SAS high-FPS poll reports stale EOF after retrigger");
+            }
             wlan_runtime.memory().zero(sas_output, 0x400u);
             sas_context = {};
             sas_context.set_gpr(4u, sas_core); sas_context.set_gpr(5u, sas_output);
@@ -12858,6 +13157,19 @@ bool run_profile_self_tests(std::string &error) {
             // unchanged (the old stub) made those voices completely inaudible.
             configure_voice(sas_loop_data, 1u);
             key_on_voice0();
+
+            // Repeating SetVoice with identical metadata is a parameter update,
+            // not an implicit KeyOn.  Vehicle audio code may do this while the
+            // engine voice is live; rewinding here traps it on the first block.
+            sas_state.voices[0].decode_offset = 16u;
+            sas_state.voices[0].history1 = 321;
+            sas_state.voices[0].history2 = -123;
+            configure_voice(sas_loop_data, 1u);
+            require(sas_state.voices[0].decode_offset == 16u &&
+                        sas_state.voices[0].history1 == 321 &&
+                        sas_state.voices[0].history2 == -123,
+                    "identical SAS SetVoice rewound an active VAG decoder");
+
             for (std::uint32_t frame = 0u; frame < 0x100u; ++frame) {
                 wlan_runtime.memory().store16(sas_output + frame * 4u, static_cast<std::uint16_t>(1000));
                 wlan_runtime.memory().store16(sas_output + frame * 4u + 2u,
