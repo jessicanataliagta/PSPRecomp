@@ -816,6 +816,7 @@ bool parse_atrac_header(std::span<const std::uint8_t> bytes, ParsedAtracHeader &
     header.file_size = static_cast<std::uint32_t>(declared_file_size);
     bool have_fmt = false;
     bool have_data = false;
+    bool subformat_atrac3plus = false;
     for (std::size_t offset = 12u; offset + 8u <= bytes.size();) {
         const std::uint32_t chunk_size = read_le32(bytes, offset + 4u);
         const std::size_t payload = offset + 8u;
@@ -836,6 +837,13 @@ bool parse_atrac_header(std::span<const std::uint8_t> bytes, ParsedAtracHeader &
             header.average_bytes_per_second = read_le32(bytes, payload + 8u);
             header.block_align = read_le16(bytes, payload + 12u);
             header.bits_per_sample = read_le16(bytes, payload + 14u);
+            // WAVE_FORMAT_EXTENSIBLE carries the codec as a SubFormat GUID at
+            // +24. This is the ATRAC3plus one (E923AABF-CB58-4471-A119-FFFA01E4CE62).
+            static constexpr std::uint8_t kAtrac3plusGuid[16]{
+                0xBF, 0xAA, 0x23, 0xE9, 0x58, 0xCB, 0x71, 0x44,
+                0xA1, 0x19, 0xFF, 0xFA, 0x01, 0xE4, 0xCE, 0x62};
+            subformat_atrac3plus = chunk_size >= 40u &&
+                std::memcmp(bytes.data() + payload + 24u, kAtrac3plusGuid, 16u) == 0;
             have_fmt = true;
         } else if (std::memcmp(bytes.data() + offset, "fact", 4u) == 0 && chunk_size >= 4u) {
             header.total_samples = read_le32(bytes, payload);
@@ -855,7 +863,13 @@ bool parse_atrac_header(std::span<const std::uint8_t> bytes, ParsedAtracHeader &
     if (!have_fmt || !have_data || header.channels == 0u || header.channels > 2u ||
         header.sample_rate == 0u || header.block_align == 0u) return false;
     // PSP ATRAC files use WAVE_FORMAT_EXTENSIBLE (0xFFFE) or the legacy ATRAC3 tag.
-    header.atrac3plus = header.format_tag == 0xFFFEu && header.block_align >= 0x180u;
+    // Decide by the SubFormat GUID: a frame-size threshold (>= 0x180) misread
+    // the 48 kbps (280-byte) and 64 kbps (376-byte) ATRAC3plus streams -- every
+    // cutscene voice in VCS -- as ATRAC3, so each 2048-sample frame was
+    // accounted as 1024 and the guest's stream buffer drained twice as fast,
+    // starving the voice halfway through a scene.
+    header.atrac3plus = header.format_tag == 0xFFFEu &&
+        (subformat_atrac3plus || header.block_align >= 0x180u);
     if (!header.atrac3plus && header.format_tag != 0x0270u && header.format_tag != 0xFFFEu) return false;
     if (header.total_samples == 0u) {
         const std::uint32_t samples_per_frame = header.atrac3plus ? 2048u : 1024u;

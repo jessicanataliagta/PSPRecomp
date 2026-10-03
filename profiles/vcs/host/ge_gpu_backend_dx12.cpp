@@ -3824,13 +3824,21 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
             const D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsv_cpu(s, target->dsv_index);
             s.list->OMSetRenderTargets(1u, &rtv, FALSE, &dsv);
 
-            // PSP EDRAM is persistent. Offscreen colors survive across display
-            // intervals and are only initialized once; the displayed surface is
-            // cleared once per interval to retain the stable Stage 44.4 behavior.
+            // PSP EDRAM is persistent: colors survive across display intervals
+            // and are only initialized once. That includes the displayed
+            // surface -- VCS' speed blur composites the world at ~70% alpha
+            // over the previous frame there, and clearing it each interval
+            // turned the blur into a plain darkening. The old per-interval
+            // clear stays available behind PSPRECOMP_DX12_CLEAR_DISPLAY=1.
+            static const bool clear_display_each_frame = [] {
+                const char *text = std::getenv("PSPRECOMP_DX12_CLEAR_DISPLAY");
+                return text != nullptr && *text != '\0' && *text != '0';
+            }();
             const bool first_ever_use = target->last_render_epoch == 0u;
             const bool first_use_this_frame = target->last_render_epoch != s.frame_epoch;
             if (first_use_this_frame) {
-                if (first_ever_use || address == s.display_framebuffer)
+                if (first_ever_use ||
+                    (clear_display_each_frame && address == s.display_framebuffer))
                     s.list->ClearRenderTargetView(rtv, black, 0u, nullptr);
                 s.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0u, 0u, nullptr);
                 target->last_render_epoch = s.frame_epoch;

@@ -833,8 +833,28 @@ HostInputState display_window_input() {
     if (controls.invert_camera_y) input.camera_y = -input.camera_y;
 
     if (const PfnXInputGetState get_state = xinput_get_state()) {
+        // Merge every connected slot instead of trusting slot 0: one physical
+        // pad can surface twice (e.g. a Steam/xpad virtual mirror under
+        // Proton), and the live one is not necessarily the first.
         XInputStatePacket pad{};
-        if (get_state(0u, &pad) == 0u) {
+        bool any_connected = false;
+        const auto stronger = [](std::int16_t a, std::int16_t b) {
+            return std::abs(static_cast<int>(b)) > std::abs(static_cast<int>(a)) ? b : a;
+        };
+        for (std::uint32_t slot = 0u; slot < 4u; ++slot) {
+            XInputStatePacket slot_state{};
+            if (get_state(slot, &slot_state) != 0u) continue;
+            any_connected = true;
+            const XInputGamepad &g = slot_state.gamepad;
+            pad.gamepad.buttons |= g.buttons;
+            pad.gamepad.left_trigger = std::max(pad.gamepad.left_trigger, g.left_trigger);
+            pad.gamepad.right_trigger = std::max(pad.gamepad.right_trigger, g.right_trigger);
+            pad.gamepad.lx = stronger(pad.gamepad.lx, g.lx);
+            pad.gamepad.ly = stronger(pad.gamepad.ly, g.ly);
+            pad.gamepad.rx = stronger(pad.gamepad.rx, g.rx);
+            pad.gamepad.ry = stronger(pad.gamepad.ry, g.ry);
+        }
+        if (any_connected) {
             const std::uint16_t b = pad.gamepad.buttons;
             // The pad follows San Andreas' console layout, which is also the
             // scheme ThirteenAG's plugin assumes: cross accelerates and
