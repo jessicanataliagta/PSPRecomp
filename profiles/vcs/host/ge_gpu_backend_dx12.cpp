@@ -2,17 +2,22 @@
 #include "ge_cloud_camera_math.hpp"
 #include "ge_cloudworks_present_shader.hpp"
 #include "vcs_config.hpp"
+#include "vcs_hud_texture_enhance.hpp"
 #include "vcs_runtime_log.hpp"
 
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <filesystem>
 #include <limits>
+#include <list>
+#include <chrono>
 #include <iterator>
 #include <span>
 #include <sstream>
@@ -320,6 +325,12 @@ struct Dx12GeState {
     std::uint32_t presented_framebuffer{};
     std::uint32_t missed_display_intervals{};
     bool swapchain_tearing{};
+    // Dynamic vsync: the monitor's refresh, and the PSP vblank of the last
+    // present, from which each frame's own sync interval is derived.
+    std::uint32_t monitor_refresh_hz{};
+    std::uint64_t last_present_vblank{};
+    std::uint32_t logged_sync_intervals{};
+    UINT last_sync_interval{};
     HWND native_window{};
     bool readback_enabled{};
     bool texture_upload_ring_enabled{true};
@@ -1768,6 +1779,8 @@ bool create_swapchain_buffers(Dx12GeState &s, std::string &error) noexcept {
     return true;
 }
 
+std::uint32_t query_monitor_refresh_hz(IDXGISwapChain3 &swapchain) noexcept;
+
 bool ensure_swapchain(Dx12GeState &s, std::string &error) noexcept {
     if (s.native_window == nullptr) {
         error = "DX12 GE direct present has no active display window";
@@ -1829,9 +1842,46 @@ bool ensure_swapchain(Dx12GeState &s, std::string &error) noexcept {
     s.swap_height = surface_height;
     if (!create_swapchain_buffers(s, error)) return false;
     s.report.swapchain_active = true;
+    s.monitor_refresh_hz = query_monitor_refresh_hz(*s.swapchain.Get());
     runtime_log_line("dx12 ge direct swapchain created " + std::to_string(surface_width) + "x" +
-                     std::to_string(surface_height));
+                     std::to_string(surface_height) + " monitor_refresh=" +
+                     std::to_string(s.monitor_refresh_hz) + "Hz");
     return true;
+}
+
+// Refresh rate of the monitor the swapchain is on, in whole Hz (0 = unknown).
+std::uint32_t query_monitor_refresh_hz(IDXGISwapChain3 &swapchain) noexcept {
+    DEVMODEW mode{};
+    mode.dmSize = sizeof(mode);
+    ComPtr<IDXGIOutput> output;
+    DXGI_OUTPUT_DESC desc{};
+    if (SUCCEEDED(swapchain.GetContainingOutput(&output)) && SUCCEEDED(output->GetDesc(&desc)) &&
+        EnumDisplaySettingsW(desc.DeviceName, ENUM_CURRENT_SETTINGS, &mode) &&
+        mode.dmDisplayFrequency > 1u)
+        return mode.dmDisplayFrequency;
+    mode = DEVMODEW{};
+    mode.dmSize = sizeof(mode);
+    if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) && mode.dmDisplayFrequency > 1u)
+        return mode.dmDisplayFrequency;
+    return 0u;
+}
+
+// VSync=true: hold each game frame for as many monitor refreshes as the PSP
+// vblanks it spanned, so the display -- not the host sleep -- paces it. A
+// 30 fps frame on 60 Hz gets 2, a 60 fps menu frame 1, on 120 Hz 4 and 2.
+// When the ratio is not a whole number (e.g. 30 fps on 144 Hz) no interval
+// is even, so fall back to 1 and let the frame limiter pace.
+UINT dynamic_sync_interval(const Dx12GeState &s, std::uint64_t vblank) noexcept {
+    constexpr double kPspVblankHz = 59.94;
+    if (s.monitor_refresh_hz == 0u || s.last_present_vblank == 0u ||
+        vblank <= s.last_present_vblank)
+        return 1u;
+    const std::uint64_t spanned = std::min<std::uint64_t>(vblank - s.last_present_vblank, 4u);
+    const double ratio = static_cast<double>(s.monitor_refresh_hz) *
+        static_cast<double>(spanned) / kPspVblankHz;
+    const double whole = std::round(ratio);
+    if (whole < 1.0 || whole > 4.0 || std::abs(ratio - whole) > 0.06) return 1u;
+    return static_cast<UINT>(whole);
 }
 
 std::uint32_t present_sampler(Dx12GeState &s) noexcept {
@@ -2424,6 +2474,308 @@ void clear_texture_lookup_cache(Dx12GeState &s) noexcept {
     s.last_texture_lookup_key = 0u;
 }
 
+// [HudTextures] state. Kept outside the texture cache on purpose: the
+// replacement index, the decoded replacement images and the set of hashes
+// already dumped must survive evictions and palette refreshes.
+struct HudTextureStore {
+    bool indexed{false};
+    bool dump_ready{false};
+    bool logged_filter{false};
+    std::filesystem::path root;
+    std::unordered_map<std::uint64_t, std::filesystem::path> replacement_files;
+    std::unordered_map<std::uint64_t, hud_texture::Image> replacement_images;
+    std::unordered_set<std::uint64_t> rejected;
+    std::unordered_set<std::uint64_t> dumped;
+};
+
+HudTextureStore &hud_texture_store() noexcept {
+    static HudTextureStore store;
+    return store;
+}
+
+// Upscaled art larger than this per side costs more decode time and memory
+// than the 2D interface can show at any supported internal resolution.
+constexpr std::uint32_t kHudTextureMaxSide = 1024u;
+
+bool parse_hud_texture_hash(const std::filesystem::path &file, std::uint64_t &hash) noexcept {
+    const std::string stem = file.stem().string();
+    if (stem.size() != 16u) return false;
+    std::uint64_t value = 0u;
+    for (const char c : stem) {
+        std::uint64_t digit = 0u;
+        if (c >= '0' && c <= '9') digit = static_cast<std::uint64_t>(c - '0');
+        else if (c >= 'a' && c <= 'f') digit = static_cast<std::uint64_t>(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') digit = static_cast<std::uint64_t>(c - 'A' + 10);
+        else return false;
+        value = (value << 4u) | digit;
+    }
+    hash = value;
+    return true;
+}
+
+// One recursive scan, on first use. Files added while the game runs are not
+// picked up; the dump folder is skipped so dumped originals never replace
+// themselves (that would also switch the filter off for them).
+void index_hud_texture_replacements(HudTextureStore &store) {
+    store.indexed = true;
+    std::error_code ec;
+    std::filesystem::recursive_directory_iterator it(
+        store.root, std::filesystem::directory_options::skip_permission_denied, ec);
+    const std::filesystem::recursive_directory_iterator end;
+    for (; !ec && it != end; it.increment(ec)) {
+        std::error_code entry_ec;
+        if (it->is_directory(entry_ec)) {
+            if (it->path().filename() == "dump") it.disable_recursion_pending();
+            continue;
+        }
+        if (!it->is_regular_file(entry_ec)) continue;
+        std::string extension = it->path().extension().string();
+        std::transform(extension.begin(), extension.end(), extension.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::uint64_t hash = 0u;
+        if (extension == ".dds" && parse_hud_texture_hash(it->path(), hash))
+            store.replacement_files.emplace(hash, it->path());
+    }
+    std::ostringstream line;
+    line << "HudTextures: " << store.replacement_files.size()
+         << " replacement texture(s) indexed in " << store.root.string();
+    runtime_log_line(line.str());
+}
+
+// Through-mode (2D interface) textures only, and only single-level ones: the
+// guest never mipmaps its HUD art, and a mipmapped through-mode draw is a sign
+// of something that is not interface. On success `packed` holds a complete
+// mip chain for the new size and `sampler_draw` the sampler state to use with
+// it (linear + trilinear mips: the enhanced image is meant to be filtered).
+// Returns false, leaving the texture as the guest decoded it, when nothing
+// applies or anything fails.
+// Finished [HudTextures] results (mip chain included), keyed by the guest
+// content plus every input that shapes the output. VCS cycles a few HUD images
+// through fresh texture-cache keys every frame (two 128x128 sources at
+// 0x08BDBED0/0x08BDBF20 measured at ~26 inserts/s, ~100% recurring content),
+// so the texture cache alone re-ran the upscale for each one. Lookup and
+// promotion are O(1) (hash map + list splice); the least recently used entries
+// are evicted once CacheEntries or CacheMB is exceeded.
+struct HudResultCache {
+    struct Entry {
+        std::vector<std::byte> packed;
+        std::uint32_t source_width{}, source_height{};
+        std::uint32_t width{}, height{}, levels{};
+        std::list<std::uint64_t>::iterator recency;
+    };
+    std::unordered_map<std::uint64_t, Entry> entries;
+    std::list<std::uint64_t> recency; // front = most recently used
+    std::uint64_t bytes{};
+    std::uint64_t hits{}, misses{}, evictions{};
+    std::uint64_t miss_us{}, hit_us{}; // time spent producing vs reusing results
+};
+
+HudResultCache &hud_result_cache() noexcept {
+    static HudResultCache cache;
+    return cache;
+}
+
+void log_hud_result_cache(const HudResultCache &cache) {
+    const std::uint64_t lookups = cache.hits + cache.misses;
+    if (lookups == 0u || (lookups & 255u) != 0u) return;
+    std::ostringstream line;
+    line << "HudTextures cache: hits=" << cache.hits << " misses=" << cache.misses
+         << " evictions=" << cache.evictions << " entries=" << cache.entries.size()
+         << " MiB=" << (cache.bytes >> 20u) << " miss_ms=" << cache.miss_us / 1000u
+         << " hit_ms=" << cache.hit_us / 1000u;
+    runtime_log_line(line.str());
+}
+
+void insert_hud_result(HudResultCache &cache, std::uint64_t key, const std::vector<std::byte> &packed,
+                       std::uint32_t source_width, std::uint32_t source_height,
+                       std::uint32_t width, std::uint32_t height, std::uint32_t levels) {
+    const HudTexturesConfiguration &hud = vcs_configuration().hud_textures;
+    const std::uint64_t byte_limit = static_cast<std::uint64_t>(hud.cache_mb) << 20u;
+    if (hud.cache_entries == 0u || packed.size() > byte_limit) return;
+    // Drop the oldest entries until the new one fits under both limits.
+    while (!cache.recency.empty() &&
+           (cache.entries.size() >= hud.cache_entries || cache.bytes + packed.size() > byte_limit)) {
+        const auto victim = cache.entries.find(cache.recency.back());
+        cache.recency.pop_back();
+        if (victim == cache.entries.end()) continue;
+        cache.bytes -= victim->second.packed.size();
+        cache.entries.erase(victim);
+        ++cache.evictions;
+    }
+    cache.recency.push_front(key);
+    HudResultCache::Entry entry;
+    entry.packed = packed;
+    entry.source_width = source_width;
+    entry.source_height = source_height;
+    entry.width = width;
+    entry.height = height;
+    entry.levels = levels;
+    entry.recency = cache.recency.begin();
+    cache.bytes += entry.packed.size();
+    cache.entries.insert_or_assign(key, std::move(entry));
+}
+
+bool enhance_hud_texture(const GeGpuDrawDescriptor &draw, std::uint64_t content_checksum,
+                         std::uint32_t &width, std::uint32_t &height, std::uint32_t &mip_levels,
+                         std::vector<std::byte> &packed, GeGpuDrawDescriptor &sampler_draw) noexcept {
+    const VcsConfiguration &config = vcs_configuration();
+    const HudTexturesConfiguration &hud = config.hud_textures;
+    if (!draw.through || mip_levels != 1u) return false;
+    if (hud.filter == HudTextureFilter::Off && !hud.dump && !hud.replace) return false;
+    try {
+        const auto finish = [&](std::uint32_t levels) {
+            sampler_draw = draw;
+            sampler_draw.texture_linear = true;
+            sampler_draw.texture_min_linear = true;
+            sampler_draw.texture_mag_linear = true;
+            sampler_draw.texture_mipmap_enabled = levels > 1u;
+            sampler_draw.texture_mipmap_linear = true;
+            // MaxLOD past the real chain is clamped by D3D12; one constant keeps
+            // enhanced textures to four sampler variants (clamp U x clamp V).
+            sampler_draw.texture_max_level = 7u;
+            sampler_draw.texture_level_mode = 0u;
+            sampler_draw.texture_level_offset16 = 0;
+            sampler_draw.texture_selected_level = 0u;
+        };
+        // Everything the result depends on besides the pixels themselves.
+        std::uint64_t result_key = hash_mix(content_checksum, width);
+        result_key = hash_mix(result_key, height);
+        result_key = hash_mix(result_key,
+            static_cast<std::uint64_t>(hud.filter) | (static_cast<std::uint64_t>(hud.max_scale) << 4u) |
+            (static_cast<std::uint64_t>(hud.replace) << 8u) |
+            (static_cast<std::uint64_t>(draw.texture_use_alpha) << 9u) |
+            (static_cast<std::uint64_t>(draw.texture_clamp_u) << 10u) |
+            (static_cast<std::uint64_t>(draw.texture_clamp_v) << 11u));
+        HudResultCache &results = hud_result_cache();
+        const auto started = std::chrono::steady_clock::now();
+        const auto elapsed_us = [&] {
+            return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - started).count());
+        };
+        if (const auto cached = results.entries.find(result_key);
+            cached != results.entries.end() && cached->second.source_width == width &&
+            cached->second.source_height == height) {
+            results.recency.splice(results.recency.begin(), results.recency, cached->second.recency);
+            packed = cached->second.packed;
+            width = cached->second.width;
+            height = cached->second.height;
+            mip_levels = cached->second.levels;
+            finish(mip_levels);
+            ++results.hits;
+            results.hit_us += elapsed_us();
+            log_hud_result_cache(results);
+            return true;
+        }
+        const std::uint32_t source_width = width;
+        const std::uint32_t source_height = height;
+        HudTextureStore &store = hud_texture_store();
+        if (store.root.empty()) {
+            store.root = std::filesystem::path(hud.directory);
+            if (store.root.is_relative()) store.root = config.executable_directory / store.root;
+        }
+        std::uint64_t hash = 0u;
+        if (hud.dump || hud.replace)
+            hash = hud_texture::content_hash(packed.data(), width, height);
+
+        if (hud.dump && store.dumped.insert(hash).second) {
+            const std::filesystem::path folder = store.root / "dump";
+            std::error_code ec;
+            if (!store.dump_ready) {
+                store.dump_ready = true;
+                std::filesystem::create_directories(folder, ec);
+                runtime_log_line("HudTextures: dumping 2D textures to " + folder.string());
+            }
+            const std::filesystem::path file = folder / (hud_texture::hash_name(hash) + ".dds");
+            if (!std::filesystem::exists(file, ec) &&
+                !hud_texture::write_dds(file, width, height, packed.data()))
+                runtime_log_error("hud texture dump", "cannot write " + file.string());
+        }
+
+        const hud_texture::Image *replacement = nullptr;
+        if (hud.replace) {
+            if (!store.indexed) index_hud_texture_replacements(store);
+            if (const auto loaded = store.replacement_images.find(hash);
+                loaded != store.replacement_images.end()) {
+                replacement = &loaded->second;
+            } else if (const auto file = store.replacement_files.find(hash);
+                       file != store.replacement_files.end() && !store.rejected.contains(hash)) {
+                hud_texture::Image image;
+                std::string error;
+                if (!hud_texture::read_dds(file->second, image, error)) {
+                    store.rejected.insert(hash);
+                    runtime_log_error("hud texture replace", file->second.string() + ": " + error);
+                } else if (static_cast<std::uint64_t>(image.width) * height !=
+                           static_cast<std::uint64_t>(image.height) * width) {
+                    // UVs are normalized against the guest size, so any scale
+                    // works -- but a different aspect would distort the art.
+                    store.rejected.insert(hash);
+                    std::ostringstream line;
+                    line << file->second.string() << ": " << image.width << 'x' << image.height
+                         << " does not have the aspect ratio of the original " << width << 'x' << height;
+                    runtime_log_error("hud texture replace", line.str());
+                } else {
+                    std::ostringstream line;
+                    line << "HudTextures: replaced " << hud_texture::hash_name(hash) << " ("
+                         << width << 'x' << height << " -> " << image.width << 'x' << image.height << ')';
+                    runtime_log_line(line.str());
+                    replacement = &store.replacement_images.emplace(hash, std::move(image)).first->second;
+                }
+            }
+        }
+
+        std::vector<std::byte> base;
+        std::uint32_t out_width = 0u;
+        std::uint32_t out_height = 0u;
+        if (replacement != nullptr) {
+            base = replacement->rgba;
+            out_width = replacement->width;
+            out_height = replacement->height;
+        } else {
+            if (hud.filter == HudTextureFilter::Off) return false;
+            if (static_cast<std::uint64_t>(width) * height < 16u) return false;
+            // Enlarging past what the target resolves is wasted work: one PSP
+            // pixel is about (internal height / 272) target pixels.
+            const InternalResolutionDimensions internal = resolve_internal_resolution(config.rendering);
+            const float ratio = std::min(static_cast<float>(internal.width) / static_cast<float>(kReferenceWidth),
+                                         static_cast<float>(internal.height) / static_cast<float>(kReferenceHeight));
+            std::uint32_t factor = std::min<std::uint32_t>(
+                std::clamp(hud.max_scale, 2u, 4u), static_cast<std::uint32_t>(ratio + 0.1f));
+            while (factor > 1u && std::max(width, height) * factor > kHudTextureMaxSide) --factor;
+            if (factor < 2u) return false;
+            // A draw that ignores texture alpha may still show the colour of
+            // alpha-0 texels, so only bleed where alpha actually composites.
+            if (draw.texture_use_alpha)
+                hud_texture::bleed_transparent_rgb(packed.data(), width, height);
+            const bool sharp = hud.filter == HudTextureFilter::Sharp;
+            base = hud_texture::upscale(packed.data(), width, height, factor,
+                                        draw.texture_clamp_u, draw.texture_clamp_v, sharp);
+            out_width = width * factor;
+            out_height = height * factor;
+            if (!store.logged_filter) {
+                store.logged_filter = true;
+                std::ostringstream line;
+                line << "HudTextures: " << (sharp ? "Sharp" : "Smooth") << " filter active, up to "
+                     << factor << "x for this internal resolution";
+                runtime_log_line(line.str());
+            }
+        }
+        const std::uint32_t levels = hud_texture::mip_level_count(out_width, out_height);
+        packed = hud_texture::build_mip_chain(std::move(base), out_width, out_height, levels);
+        width = out_width;
+        height = out_height;
+        mip_levels = levels;
+        finish(levels);
+        ++results.misses;
+        results.miss_us += elapsed_us();
+        insert_hud_result(results, result_key, packed, source_width, source_height,
+                          out_width, out_height, levels);
+        log_hud_result_cache(results);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 bool prepare_texture_upload(Dx12GeState &s, const GeGpuDrawDescriptor &draw,
                             std::uint32_t base_width, std::uint32_t base_height,
                             std::uint32_t mip_levels, std::vector<std::byte> packed) noexcept {
@@ -2460,6 +2812,12 @@ bool prepare_texture_upload(Dx12GeState &s, const GeGpuDrawDescriptor &draw,
         clear_texture_lookup_cache(s);
         s.textures.erase(found);
     }
+    // [HudTextures]: enhance/replace 2D interface art. The checksum above stays
+    // that of the guest's decode, so unchanged content keeps hitting the cache
+    // without paying for the enhancement again.
+    GeGpuDrawDescriptor sampler_draw = draw;
+    if (enhance_hud_texture(draw, checksum, base_width, base_height, mip_levels, packed, sampler_draw))
+        expected = packed.size();
     const std::uint32_t entry_limit = vcs_configuration().rendering.texture_cache_entries;
     const std::uint64_t byte_limit = static_cast<std::uint64_t>(vcs_configuration().rendering.texture_cache_mb) * 1024ull * 1024ull;
     while (s.textures.size() >= entry_limit || s.texture_cache_bytes + packed.size() > byte_limit) {
@@ -2519,7 +2877,7 @@ bool prepare_texture_upload(Dx12GeState &s, const GeGpuDrawDescriptor &draw,
         runtime_log_error("dx12 texture", "SRV descriptor heap exhausted");
         return false;
     }
-    texture.sampler_index = ensure_sampler(s, draw);
+    texture.sampler_index = ensure_sampler(s, sampler_draw);
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Format = kColorFormat;
@@ -4112,7 +4470,19 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
 
     bool presented = false;
     if (recorded_present && s.swapchain) {
-        hr = s.swapchain->Present(0u, s.swapchain_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0u);
+        // DXGI forbids ALLOW_TEARING with a non-zero sync interval.
+        const bool vsync = vcs_configuration().display.vsync;
+        const UINT sync_interval = vsync ? dynamic_sync_interval(s, vblank) : 0u;
+        if (vsync && s.logged_sync_intervals < 16u &&
+            (s.logged_sync_intervals == 0u || sync_interval != s.last_sync_interval)) {
+            ++s.logged_sync_intervals;
+            runtime_log_line("dx12 ge vsync interval=" + std::to_string(sync_interval) +
+                             " vblank=" + std::to_string(vblank));
+        }
+        s.last_sync_interval = sync_interval;
+        s.last_present_vblank = vblank;
+        hr = s.swapchain->Present(sync_interval,
+                                  !vsync && s.swapchain_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0u);
         if (SUCCEEDED(hr)) {
             presented = true;
             s.direct_present_ok = true;

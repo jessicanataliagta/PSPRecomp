@@ -50,6 +50,8 @@ struct DisplayConfiguration {
     // time (30 is full speed), rather than merely echoing the PSP's 60 Hz
     // vblank clock.
     bool show_fps{false};
+    // Wait for the display's vertical blank when presenting (no tearing).
+    bool vsync{false};
 };
 
 struct PresentationRectangle {
@@ -173,6 +175,41 @@ struct WidescreenConfiguration {
     std::uint32_t aspect_y{0u};
 };
 
+enum class HudTextureFilter : std::uint8_t {
+    Off,
+    Smooth,
+    Sharp,
+};
+
+// [HudTextures]: through-mode (2D interface) texture enhancement in the
+// DirectX 12 backend. See host/vcs_hud_texture_enhance.hpp.
+//
+// Off by default so a missing INI keeps PSP parity; the shipped VCSNative.ini
+// turns the filter on.
+struct HudTexturesConfiguration {
+    // Off: upload the PSP art as decoded. Smooth: alpha bleeding + Catmull-Rom
+    // upscale + mip chain, sampled linearly. Sharp: Smooth plus edge-only ramp
+    // narrowing, which is what makes glyphs and icon outlines read as HD.
+    HudTextureFilter filter{HudTextureFilter::Off};
+    // Largest integer enlargement (2-4). Also limited by the internal
+    // resolution (no point enlarging past what the target can show) and by a
+    // 1024-texel cap per side.
+    std::uint32_t max_scale{4u};
+    // Write every distinct 2D texture once to <Directory>/dump/<hash>.dds.
+    bool dump{false};
+    // Use <Directory>/**/<hash>.dds in place of the game's texture when present.
+    // Any size with the original aspect ratio is accepted.
+    bool replace{false};
+    // Relative paths are resolved against the executable's directory.
+    std::string directory{"TexturesHD"};
+    // LRU cache of finished (enhanced + mip-chained) results keyed by guest
+    // content. VCS cycles some HUD images through fresh texture keys every
+    // frame; without it each recurrence pays the full upscale again. The
+    // least recently used entries are dropped once either limit is exceeded.
+    std::uint32_t cache_entries{256u};
+    std::uint32_t cache_mb{128u};
+};
+
 // Standalone ProperShaders.ini feature. Values normally supplied by the San
 // Andreas timecycle/weather integration remain explicit placeholders until the
 // equivalent VCS guest hooks exist. Keeping the inputs separate is important:
@@ -249,6 +286,7 @@ struct VcsConfiguration {
     TimingConfiguration timing{};
     DiagnosticsConfiguration diagnostics{};
     WidescreenConfiguration widescreen{};
+    HudTexturesConfiguration hud_textures{};
     VolumetricCloudsConfiguration volumetric_clouds{};
     std::filesystem::path source_path{};
     // Where the executable lives. Saves go beside it rather than into the game
