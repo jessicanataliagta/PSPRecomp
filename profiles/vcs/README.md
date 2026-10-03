@@ -78,6 +78,53 @@ For an uncapped CPU/GE measurement, use `profiles\vcs\scripts\bench.bat`.
 
 The generated VCS corpus is intentionally excluded from MSVC whole-program IR in the normal release build. Later AOT cross-unit optimizations make whole-program analysis of all generated units unnecessarily expensive in linker memory. This does not disable per-unit `/Ox`; it only prevents those generated units from being deferred to link-time code generation. Host/runtime LTCG remains available, and the release linker prints LTCG status while it runs.
 
+## Build and run on Linux
+
+The VCS host is Windows/DX12 code, so on Linux the Windows executable is
+cross-compiled with clang-cl and run through Proton (vkd3d-proton provides DX12).
+
+1. Fetch the MSVC CRT and Windows SDK headers/libraries with
+   [xwin](https://github.com/Jake-Shadle/xwin). This requires accepting the
+   Microsoft license:
+
+   ```bash
+   xwin --accept-license --arch x86_64 splat --output ~/.xwin
+   ```
+
+2. Configure and build (`clang-cl`, `lld-link`, `llvm-rc`, `llvm-lib` and
+   `llvm-mt` from LLVM must be on `PATH`):
+
+   ```bash
+   cmake -S . -B out/vcs-win -G Ninja \
+     -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/clangcl-xwin.cmake \
+     -DCMAKE_BUILD_TYPE=Release -DPSPRECOMP_PROFILE=vcs \
+     -DPSPRECOMP_GENERATED_OPT_LEVEL=3 -DPSPRECOMP_LTO=OFF -DPSPRECOMP_NATIVE_AVX2=ON \
+     -DPSPRECOMP_AOT_ASSUME_NO_WRITE_WATCH=ON -DPSPRECOMP_AOT_PRODUCTION_FASTPATHS=ON \
+     -DPSPRECOMP_MSVC_MP_JOBS=1 -DPSPRECOMP_PROFILE_GUIDED_AOT=ON \
+     -DPSPRECOMP_HOT_GENERATED_OPT_LEVEL=3 -DPSPRECOMP_GENERATED_INLINE_LEVEL=0 \
+     -DPSPRECOMP_HOT_GENERATED_INLINE_LEVEL=3 -DPSPRECOMP_VCS_AOT_LTO=OFF \
+     -DPSPRECOMP_BUILD_TESTS=OFF -DPSPRECOMP_BUILD_PROFILE_TESTS=OFF
+   ninja -C out/vcs-win -j8 VCSNative
+   ```
+
+   Each generated AOT unit needs roughly 1 GB of RAM at `/O3`; lower `-j` on
+   machines with less than 16 GB.
+
+3. Prepare `profiles/vcs/game` as described above, then run:
+
+   ```bash
+   profiles/vcs/scripts/play_proton.sh [GAME_ROOT]
+   ```
+
+   It mirrors `play.bat` (every `PSPRECOMP_*` switch can be overridden from the
+   environment) and uses Proton 10.0 from the Steam library by default (`PROTON`
+   selects another). `PSPRECOMP_DX12_PACKED_0115` defaults to `0` here: the packed
+   0x0115 GPU decode produces exploded geometry under vkd3d-proton.
+
+`PSPRECOMP_STDERR_FILE=<windows path>` writes the runtime's stderr diagnostics
+(`[audio-host]`, `[atrac]`, `[realtime-speed]`, ...) to a file, since a GUI
+executable has no console and Proton discards the stream.
+
 ## Resolution configuration
 
 `profiles/vcs/config/VCSNative.ini` exposes both the presentation resolution and the internal render resolution.

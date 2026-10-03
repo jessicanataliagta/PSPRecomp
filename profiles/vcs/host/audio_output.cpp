@@ -126,6 +126,14 @@ std::size_t configured_prebuffer_blocks() {
     return std::clamp<std::size_t>(static_cast<std::size_t>(value), 2u, kBlockCount - 2u);
 }
 
+bool running_under_wine() {
+    static const bool wine = [] {
+        const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        return ntdll != nullptr && GetProcAddress(ntdll, "wine_get_version") != nullptr;
+    }();
+    return wine;
+}
+
 std::size_t outstanding_blocks(const AudioState &state) {
     return static_cast<std::size_t>(std::count_if(
         state.blocks.begin(), state.blocks.end(), [](const Block &block) {
@@ -312,7 +320,11 @@ bool queue_one_block(AudioState &state) {
 void advance_locked(AudioState &state, std::uint64_t guest_time_us) {
     if (!state.timeline_anchored || !state.opened) return;
     std::size_t outstanding = outstanding_blocks(state);
-    if (state.playback_started) {
+    // Wine's winmm marks a header done once it is copied into its own mixer
+    // buffer, long before it is heard, so an empty queue there is not an
+    // underrun -- and its waveOutPause does not hold the queue either. Pausing
+    // to rebuffer only starves it; let Wine's buffer absorb the jitter.
+    if (state.playback_started && !running_under_wine()) {
         if (outstanding == 0u) {
             // Once waveOut drains completely, immediately writing one block at
             // a time leaves a permanent train of audible gaps. Pause the empty

@@ -10,6 +10,7 @@
 #include "ge_renderer.hpp"
 #include "ge_gpu_backend.hpp"
 #include "vcs_project2dfx.hpp"
+#include "vcs_runtime_log.hpp"
 
 #include "psprecomp/common.hpp"
 #include "psprecomp/deflate.hpp"
@@ -4132,6 +4133,7 @@ void report_realtime_speed_if_requested() {
                << " diagnosis=" << diagnosis << "\n";
     const std::string speed_text = speed_line.str();
     std::cerr.write(speed_text.data(), static_cast<std::streamsize>(speed_text.size()));
+    runtime_log_line(std::string_view(speed_text).substr(0u, speed_text.size() - 1u));
 
     realtime_speed_stats.host_start = now;
     realtime_speed_stats.guest_start = virtual_time_us;
@@ -4171,6 +4173,12 @@ GpuTimingCensus gpu_timing_census;
 void write_diag_line(const std::ostringstream &line) {
     const std::string text = line.str();
     std::cerr.write(text.data(), static_cast<std::streamsize>(text.size()));
+    // A GUI-subsystem build has no console (and Proton drops its stderr), so
+    // mirror the diagnostic into the runtime log as well.
+    std::string_view logged(text);
+    while (!logged.empty() && (logged.back() == '\n' || logged.back() == '\r'))
+        logged.remove_suffix(1u);
+    if (!logged.empty()) runtime_log_line(logged);
 }
 
 // Paces the vblank loop against the guest clock.
