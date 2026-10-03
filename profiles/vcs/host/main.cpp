@@ -11,6 +11,7 @@
 #include "vcs_project2dfx.hpp"
 #include "vcs_hdr_post.hpp"
 #include "vcs_runtime_log.hpp"
+#include "vcs_disc_prefetch.hpp"
 
 #include <algorithm>
 #include <array>
@@ -173,6 +174,7 @@ int main(int argc, char **argv) {
         vcs::runtime_log_line(std::string("rendering backend=") +
                               vcs::rendering_backend_name(configuration.rendering.backend));
         validate_vcs_game_root(root);
+        if (configuration.disc.prefetch) vcs::start_disc_prefetch(root);
 
         psprecomp::Elf32Image elf = psprecomp::Elf32Image::from_file(executable);
         psprecomp::Runtime runtime(32u * 1024u * 1024u);

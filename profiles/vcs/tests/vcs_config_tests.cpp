@@ -56,6 +56,8 @@ int main() {
                    << "MouseSensitivity=17\n"
                    << "InvertCameraY=true\n"
                    << "PedCameraUpLimitDegrees=40\n"
+                   << "[Disc]\n"
+                   << "Prefetch=false\n"
                    << "[Widescreen]\n"
                    << "Enabled=true\n"
                    << "AspectRatio=21:9\n"
@@ -184,6 +186,7 @@ int main() {
                 "ProperShaders.ini cloud parameters were not parsed");
         // Widescreen: explicit ratio, "auto", and off.  The correction must be
         // exactly neutral when disabled -- PSP parity stays the baseline.
+        require(!config.disc.prefetch, "Disc.Prefetch was not parsed");
         require(config.widescreen.enabled, "Widescreen.Enabled was not parsed");
         require(config.widescreen.aspect_x == 21u && config.widescreen.aspect_y == 9u,
                 "Widescreen.AspectRatio 'x:y' was not parsed");
@@ -231,6 +234,7 @@ int main() {
         }
 
         require(!missing.loaded_from_file, "missing INI was reported as loaded");
+        require(missing.disc.prefetch, "missing INI must keep disc prefetch enabled");
         require(missing.display.resolution_mode == vcs::DisplayResolutionMode::PspNative,
                 "missing INI did not preserve PSP-native default");
         require(missing.display.custom_width == 480u && missing.display.custom_height == 272u,

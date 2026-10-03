@@ -484,6 +484,16 @@ void apply_controls_key(VcsConfiguration &config, const std::string &key,
     warning(config, line, "unknown [Controls] key '" + key + "'");
 }
 
+void apply_disc_key(VcsConfiguration &config, const std::string &key,
+                    const std::string &value, std::size_t line) {
+    if (key == "prefetch") {
+        if (!parse_bool(value, config.disc.prefetch))
+            warning(config, line, "Disc.Prefetch expects true/false");
+        return;
+    }
+    warning(config, line, "unknown [Disc] key '" + key + "'");
+}
+
 void apply_widescreen_key(VcsConfiguration &config, const std::string &key,
                           const std::string &value, std::size_t line) {
     if (key == "enabled") {
@@ -709,6 +719,8 @@ VcsConfiguration load_vcs_configuration(const std::filesystem::path &path) {
             apply_timing_key(config, key, value, line_number);
         else if (section == "diagnostics" || section == "logging")
             apply_diagnostics_key(config, key, value, line_number);
+        else if (section == "disc")
+            apply_disc_key(config, key, value, line_number);
         else if (section == "widescreen")
             apply_widescreen_key(config, key, value, line_number);
         else if (section == "controls")
