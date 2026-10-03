@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -215,6 +216,14 @@ struct VolumetricCloudsConfiguration {
 // constant 0x3FE38E39 -- exactly 16/9 -- and everything is relative to it.
 inline constexpr float kGameNativeAspectRatio = 16.0f / 9.0f;
 
+// The game's own front-end preferences (DISPLAY page of the pause menu),
+// forced from the INI. Each field is optional: absent = the game's own value
+// (menu / save) is left untouched. Applied by vcs_game_options.hpp.
+struct GameConfiguration {
+    std::optional<bool> subtitles{};
+    std::optional<bool> hud{};
+};
+
 struct ControlsConfiguration {
     // Mouse and right-stick camera. Needs the guest-side hook, which bypasses
     // the game's own camera conditions, so it is opt-in.
@@ -242,6 +251,7 @@ struct ControlsConfiguration {
 };
 
 struct VcsConfiguration {
+    GameConfiguration game{};
     ControlsConfiguration controls{};
     DisplayConfiguration display{};
     RenderingConfiguration rendering{};

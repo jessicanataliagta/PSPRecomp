@@ -453,6 +453,27 @@ bool parse_aspect_ratio(const std::string &value, std::uint32_t &x, std::uint32_
     return true;
 }
 
+void apply_game_key(VcsConfiguration &config, const std::string &key,
+                    const std::string &value, std::size_t line) {
+    const auto set_optional = [&](std::optional<bool> &target, const char *name) {
+        bool parsed = false;
+        if (!parse_bool(value, parsed)) {
+            warning(config, line, std::string("Game.") + name + " expects true/false");
+            return;
+        }
+        target = parsed;
+    };
+    if (key == "subtitles" || key == "showsubtitles") {
+        set_optional(config.game.subtitles, "Subtitles");
+        return;
+    }
+    if (key == "hud" || key == "hudmode") {
+        set_optional(config.game.hud, "Hud");
+        return;
+    }
+    warning(config, line, "unknown [Game] key '" + key + "'");
+}
+
 void apply_controls_key(VcsConfiguration &config, const std::string &key,
                         const std::string &value, std::size_t line) {
     if (key == "camerastick" || key == "mousecamera") {
@@ -713,6 +734,8 @@ VcsConfiguration load_vcs_configuration(const std::filesystem::path &path) {
             apply_widescreen_key(config, key, value, line_number);
         else if (section == "controls")
             apply_controls_key(config, key, value, line_number);
+        else if (section == "game")
+            apply_game_key(config, key, value, line_number);
         // These sections belong to the optional Project2DFX module, which
         // deliberately owns its parser so it can be compiled independently of
         // the core display/input configuration. They are nevertheless valid

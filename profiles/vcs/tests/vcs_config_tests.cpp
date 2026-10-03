@@ -51,6 +51,8 @@ int main() {
                    << "LogToFile=true\n"
                    << "LogFile=vcs-config-test.log\n"
                    << "FlushEveryLine=false\n"
+                   << "[Game]\n"
+                   << "Subtitles=false\n"
                    << "[Controls]\n"
                    << "CameraStick=true\n"
                    << "MouseSensitivity=17\n"
@@ -131,6 +133,10 @@ int main() {
                 "Diagnostics.LogFile was not parsed");
         require(!config.diagnostics.flush_every_line,
                 "Diagnostics.FlushEveryLine was not parsed");
+        require(config.game.subtitles.has_value() && !*config.game.subtitles,
+                "Game.Subtitles was not parsed");
+        require(!config.game.hud.has_value(),
+                "absent Game.Hud must leave the game's own setting untouched");
         require(config.controls.camera_stick, "camera stick was not parsed");
         require(config.controls.mouse_sensitivity == 17u,
                 "mouse sensitivity was not parsed");
@@ -244,6 +250,8 @@ int main() {
                 "missing INI did not preserve PSP internal-resolution default");
         require(missing.controls.ped_camera_up_limit_degrees == 45u,
                 "missing INI did not preserve the stock on-foot camera upper limit");
+        require(!missing.game.subtitles.has_value() && !missing.game.hud.has_value(),
+                "missing INI must not force the game's own display options");
         const vcs::InternalResolutionDimensions native =
             vcs::resolve_internal_resolution(missing.rendering);
         require(native.width == 480u && native.height == 272u,

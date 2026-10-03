@@ -10,6 +10,7 @@
 #include "ge_renderer.hpp"
 #include "ge_gpu_backend.hpp"
 #include "vcs_project2dfx.hpp"
+#include "vcs_game_options.hpp"
 
 #include "psprecomp/common.hpp"
 #include "psprecomp/deflate.hpp"
@@ -7046,6 +7047,9 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         ge_gpu_backend_set_display_framebuffer(display_state.frame_buffer);
         project2dfx_render_frame(
             rt.memory(), ctx.gpr[28], display_vblank_index, display_state.frame_buffer);
+        // [Game] Subtitles/Hud: re-assert the game's own DISPLAY preferences
+        // whenever boot, a save load or the pause menu rewrote them.
+        game_options_vblank_tick(rt.memory(), ctx.gpr[28], display_vblank_index);
         // A movie frame is a finished 480x272 picture with no more image at the
         // sides, so widening it can only stretch it. Present it black-barred at
         // its own shape instead; gameplay keeps the widescreen treatment.
