@@ -81,6 +81,16 @@ public:
     const NidRegistry &nids() const noexcept;
 
     void register_function(std::uint32_t address, RecompiledFunction function, std::string name);
+    // Removes every registration in [start, end), including the dense-unit
+    // fast path for buckets that overlap it. Used when a code overlay is swapped.
+    void unregister_functions(std::uint32_t start, std::uint32_t end);
+    // Runtime-loaded code overlays: before each outer dispatch whose PC lies in
+    // [low, high), `resolver` runs and may (re)register the corpus matching the
+    // code now resident there. Overlay entries should be registered under names
+    // without the "recomp_unit_" prefix so they are never chained into directly
+    // and every entry passes through this check.
+    using CodeOverlayResolver = void (*)(Runtime &runtime, std::uint32_t pc);
+    void set_code_overlay_resolver(std::uint32_t low, std::uint32_t high, CodeOverlayResolver resolver) noexcept;
     void register_hle(std::string library, std::uint32_t nid, HleFunction function);
     [[nodiscard]] bool has_function(std::uint32_t address) const;
     [[nodiscard]] std::size_t function_count() const noexcept;
@@ -285,6 +295,14 @@ private:
     GuestMemory memory_;
     NidRegistry nids_;
     AllegrexContext cpu_;
+    CodeOverlayResolver code_overlay_resolver_{};
+    std::uint32_t code_overlay_low_{};
+    std::uint32_t code_overlay_span_{};
+    void resolve_code_overlay(std::uint32_t pc) {
+        if (code_overlay_resolver_ != nullptr &&
+            static_cast<std::uint32_t>(GuestMemory::canonical(pc) - code_overlay_low_) < code_overlay_span_)
+            code_overlay_resolver_(*this, pc);
+    }
     std::unordered_map<std::uint32_t, FunctionEntry> functions_;
     // Direct PC table, covering only the registered code window rather than all
     // of guest RAM.  direct_base_ is its 1 MiB-aligned first canonical address.

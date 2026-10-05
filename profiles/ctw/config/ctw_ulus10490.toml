@@ -1,0 +1,27 @@
+[game]
+name = "Grand Theft Auto: Chinatown Wars"
+disc_id = "ULUS-10490"
+region = "NTSC-U"
+module = "CTW"
+ram_mb = 32
+load_base = "0x08804000"
+# SHA-256 of the decrypted EBOOT (PPSSPP 1.20.4 DumpFileTypes=1 dump).
+expected_sha256 = "d6e426a7776a100ff9e1f1a04cee2c5d848f41c69e5d3c9c859978887dcaccc0"
+
+[input]
+# Decrypted dump made from PSP_GAME/SYSDIR/EBOOT.BIN. The executable is
+# intentionally not distributed with PSPRecomp.
+executable = "game/PSP_GAME/SYSDIR/EBOOT_DECRYPTED.ELF"
+game_root = "game/PSP_GAME/USRDIR"
+nids_csv = "configs/nids.csv"
+
+[output]
+report_json = "analysis/ULUS10490_report.json"
+generated_dir = "generated"
+unit_span_bytes = 16384
+
+[policy]
+missing_function = "stop"
+unsupported_instruction = "stop"
+allow_interpreter_fallback = false
+allow_jit_fallback = false

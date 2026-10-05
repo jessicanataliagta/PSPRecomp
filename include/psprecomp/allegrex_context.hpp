@@ -154,23 +154,28 @@ struct alignas(16) AllegrexContext {
     // branch and the PSP VFPU lane shuffle disappear from the AOT hot path.
     template <std::uint32_t ScalarRegister>
     PSPRECOMP_CONTEXT_FORCEINLINE void set_vfpu_scalar_bits_ct(std::uint32_t value) noexcept {
-        static_assert(ScalarRegister < 144u);
+        // Matches set_vfpu_scalar_bits(): registers past the control bank are ignored.
         if constexpr (ScalarRegister < 128u) {
             constexpr std::size_t index = vfpu_scalar_index(ScalarRegister);
             vfpu[index] = std::bit_cast<float>(value);
-        } else {
+        } else if constexpr (ScalarRegister < 144u) {
             vfpu_ctrl[ScalarRegister - 128u] = value;
+        } else {
+            (void)value;
         }
     }
 
     template <std::uint32_t ScalarRegister>
     [[nodiscard]] PSPRECOMP_CONTEXT_FORCEINLINE std::uint32_t vfpu_scalar_bits_ct() const noexcept {
-        static_assert(ScalarRegister < 144u);
+        // Matches vfpu_scalar_bits(): registers past the control bank read as zero
+        // (e.g. `mfvc $zero, $255`, used by games as a VFPU pipeline sync).
         if constexpr (ScalarRegister < 128u) {
             constexpr std::size_t index = vfpu_scalar_index(ScalarRegister);
             return std::bit_cast<std::uint32_t>(vfpu[index]);
-        } else {
+        } else if constexpr (ScalarRegister < 144u) {
             return vfpu_ctrl[ScalarRegister - 128u];
+        } else {
+            return 0u;
         }
     }
 
@@ -613,6 +618,54 @@ struct alignas(16) AllegrexContext {
         float result[4]{};
         for (std::uint32_t lane = 0u; lane < destination_length; ++lane)
             result[lane] = std::bit_cast<float>(result_bits[lane]);
+        write_vfpu_vector_with_destination_prefix(result, destination_register, destination_length);
+    }
+
+    // VI2UC / VI2C / VI2US / VI2S: narrow 32-bit integer lanes into packed
+    // 8-bit (one word from four lanes) or 16-bit (one word per lane pair)
+    // fields, keeping each lane's most significant bits. The unsigned forms
+    // clamp negative lanes to zero first and drop the sign bit.
+    void execute_vfpu_vi2x(std::uint32_t destination_register,
+                           std::uint32_t source_register,
+                           std::uint32_t source_length,
+                           std::uint32_t operation) noexcept {
+        if (source_length == 0u || source_length > 4u || operation > 3u) return;
+
+        float source[4]{};
+        read_vfpu_vector(source, source_register, source_length);
+        apply_vfpu_source_prefix(source, source_length, 0u);
+        std::uint32_t lanes[4]{};
+        for (std::uint32_t lane = 0u; lane < source_length; ++lane)
+            lanes[lane] = std::bit_cast<std::uint32_t>(source[lane]);
+        const auto clamp_unsigned = [](std::uint32_t value) noexcept {
+            return static_cast<std::int32_t>(value) < 0 ? 0u : value;
+        };
+
+        std::uint32_t result_bits[2]{};
+        std::uint32_t destination_length = 1u;
+        if (operation == 0u) { // VI2UC
+            for (std::uint32_t lane = 0u; lane < 4u; ++lane)
+                result_bits[0] |= ((clamp_unsigned(lanes[lane]) >> 23u) & 0xFFu) << (lane * 8u);
+        } else if (operation == 1u) { // VI2C
+            for (std::uint32_t lane = 0u; lane < 4u; ++lane)
+                result_bits[0] |= (lanes[lane] >> 24u) << (lane * 8u);
+        } else { // VI2US / VI2S
+            destination_length = source_length > 2u ? 2u : 1u;
+            for (std::uint32_t pair = 0u; pair < destination_length; ++pair) {
+                std::uint32_t low = lanes[pair * 2u];
+                std::uint32_t high = lanes[pair * 2u + 1u];
+                if (operation == 2u) {
+                    low = clamp_unsigned(low) >> 15u;
+                    high = clamp_unsigned(high) >> 15u;
+                } else {
+                    low >>= 16u;
+                    high >>= 16u;
+                }
+                result_bits[pair] = (low & 0xFFFFu) | (high << 16u);
+            }
+        }
+
+        const float result[2]{std::bit_cast<float>(result_bits[0]), std::bit_cast<float>(result_bits[1])};
         write_vfpu_vector_with_destination_prefix(result, destination_register, destination_length);
     }
 

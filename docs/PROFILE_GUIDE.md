@@ -39,6 +39,33 @@ The VCS profile demonstrates this split with its own `vcs_recomp` target while t
 
 Profile host code owns title-specific HLE behavior, bootstrap rules, display/audio/input integration and compatibility patches. Register guest replacements through `Runtime::register_function()` and PSP imports through `Runtime::register_hle()`.
 
+Generic PSP behaviour lives in the framework's `psprecomp_hle` library (`include/psprecomp/hle/`), extracted from the VCS host:
+
+| Header | Covers |
+|--------|--------|
+| `kernel.hpp` | threads and scheduler, callbacks, interrupts, semaphores, mutexes, event flags, pools, partitions, execution-driven clock |
+| `io.hpp` | `IoFileMgrForUser`, `ModuleMgrForUser`, virtual UMD over the extracted `PSP_GAME` tree |
+| `system.hpp` | `scePower`, `sceUmdUser` status, `LoadExecForUser`, `sceRtc` |
+| `display.hpp` | `sceDisplay` mode/framebuffer state and vblank waits |
+| `ge.hpp` | display-list interpreter and `sceGe_user`; drawing goes through a `GeRenderer` (null by default) |
+| `ge_renderer.hpp` | GE software rasterizer (`render_ge_primitive`, `test_ge_bounding_box`); title features via `GeRendererHooks` |
+| `ge_gpu.hpp` | data and entry points for an optional GPU backend; link `psprecomp_hle_gpu_null` when there is none |
+| `ge_gpu_vulkan.hpp` | Vulkan 1.3 GPU backend (`psprecomp_hle_gpu_vulkan`, built when Vulkan headers are found): render targets, render to texture, hardware transform; call `set_display_framebuffer` + `finish_frame` each vblank and present `latest_frame` |
+| `atrac.hpp` | `sceAtrac3plus` (`psprecomp_hle_atrac`, an INTERFACE library: the profile links FFmpeg); streams are matched to the disc's AT3 files |
+| `audio.hpp` | `sceAudio` channels paced on PSP time and the `sceSasCore` mixer; host playback via `AudioHooks` |
+
+A profile calls each module's `reset_*()` and `install_*_hle()` and supplies title-specific behaviour through the hook structs (`KernelHooks`, `IoHooks`, `DisplayHooks`, `GeRenderer`/`GeHooks`/`GeRendererHooks`, `AudioHooks`) rather than editing the shared code. `profiles/ctw/host/main.cpp` is the minimal example; `profiles/vcs/host/vcs_profile.cpp` shows every hook in use.
+
+### Runtime-loaded code overlays
+
+Code a title loads at run time (overlay modules) is recompiled ahead of time like the executable:
+
+- `psp_recomp <host ELF> --overlay <overlay ELF> <dir> <c++ namespace>` generates an overlay corpus. Units are bucketed from the host's code base, calls into host import stubs are honoured, and all symbols are wrapped in the namespace so many overlays sharing one address range can link into one binary.
+- `psp_recomp <host ELF> --auto <dir> <base> <span> <overlay ELF...>` seeds the host corpus with every host address the overlays reference.
+- `Runtime::set_code_overlay_resolver()` runs a profile callback before any outer dispatch into the overlay range; the callback identifies the resident overlay and swaps registrations with `Runtime::unregister_functions()` plus the overlay's `register_generated_functions()`.
+
+`profiles/ctw` (`tools/build_overlays.py`, `host/ctw_overlays.cpp`) is the reference implementation.
+
 For heavily measured guest leaves, a profile may register a native implementation with `Runtime::register_native_fast_path()`. Generated profile code can enter it through `Runtime::invoke_native_fast_path()`. The native implementation stays in the profile; the reusable runtime contains no game address.
 
 ## 5. Add CMake integration

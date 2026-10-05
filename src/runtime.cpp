@@ -448,6 +448,38 @@ void Runtime::register_function(std::uint32_t address, RecompiledFunction functi
     }
 }
 
+void Runtime::unregister_functions(std::uint32_t start, std::uint32_t end) {
+    const std::uint32_t low = memory_.canonical(start);
+    const std::uint32_t high = memory_.canonical(end);
+    if (high <= low) return;
+    std::erase_if(functions_, [&](const auto &entry) {
+        const std::uint32_t c = memory_.canonical(entry.first);
+        return c >= low && c < high;
+    });
+    for (std::uint32_t c = low & ~3u; c < high; c += 4u) {
+        const std::uint32_t delta = c - direct_base_;
+        const std::size_t index = static_cast<std::size_t>(delta) / 4u;
+        if (c < direct_base_ || index >= direct_functions_.size()) continue;
+        direct_functions_[index] = nullptr;
+        direct_chainable_[index] = nullptr;
+    }
+    if (generated_unit_span_ != 0u && high > generated_unit_base_) {
+        const std::uint32_t first = low > generated_unit_base_ ? (low - generated_unit_base_) / generated_unit_span_ : 0u;
+        const std::uint32_t last = (high - 1u - generated_unit_base_) / generated_unit_span_;
+        for (std::uint32_t unit = first; unit <= last && unit < kGeneratedUnitFastCapacity; ++unit) {
+            generated_units_[unit] = nullptr;
+            generated_unit_entries_[unit] = nullptr;
+        }
+    }
+}
+
+void Runtime::set_code_overlay_resolver(std::uint32_t low, std::uint32_t high,
+                                        CodeOverlayResolver resolver) noexcept {
+    code_overlay_low_ = GuestMemory::canonical(low);
+    code_overlay_span_ = high > low ? GuestMemory::canonical(high) - code_overlay_low_ : 0u;
+    code_overlay_resolver_ = resolver;
+}
+
 Runtime::RecompiledFunction Runtime::lookup_function(std::uint32_t address) const noexcept {
     const std::uint32_t c = memory_.canonical(address);
     const std::uint32_t delta = c - direct_base_;
@@ -577,6 +609,7 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
         auto execute_once = [&]() {
             const std::uint32_t before = cpu_.pc;
             chain_context_invalidated_ = false;
+            resolve_code_overlay(before);
             const std::int32_t dispatch_thread_uid = g_runtime_thread_uid;
             RecompiledFunction function = lookup_function(before);
             if (function == nullptr) {
@@ -647,6 +680,7 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
         for (; executed_dispatches < max_dispatches && !stopped_; ++executed_dispatches) {
             const std::uint32_t before = cpu_.pc;
             chain_context_invalidated_ = false;
+            resolve_code_overlay(before);
             const std::int32_t dispatch_thread_uid = g_runtime_thread_uid;
             // Most outer dispatches are ordinary AOT PCs.  Resolve those
             // through the tiny generated-unit table first; the old per-PC
@@ -713,6 +747,7 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
         if (profile_dispatch) ++dispatch_counts[cpu_.pc];
         const std::uint32_t before = cpu_.pc;
         chain_context_invalidated_ = false;
+        resolve_code_overlay(before);
         RecompiledFunction function = lookup_function(before);
         const FunctionEntry *function_entry = lookup_entry(before);
         if (function == nullptr) {

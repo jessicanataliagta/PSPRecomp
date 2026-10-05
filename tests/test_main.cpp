@@ -840,6 +840,16 @@ int main() {
         const auto addiu = psprecomp::decode_allegrex(0x24820001u);
         require(addiu.kind == psprecomp::OpcodeKind::Addiu && addiu.rs == 4u && addiu.rt == 2u && addiu.immediate == 1,
                 "ADDIU decode failed");
+        const auto addi = psprecomp::decode_allegrex(0x2042FFFFu);  // addi $v0, $v0, -1
+        require(addi.kind == psprecomp::OpcodeKind::Addi && addi.rs == 2u && addi.rt == 2u &&
+                    static_cast<std::int32_t>(addi.immediate) == -1,
+                "ADDI decode failed");
+        require(psprecomp::decode_allegrex(0x0048001Cu).kind == psprecomp::OpcodeKind::Madd, "MADD decode failed");
+        require(psprecomp::decode_allegrex(0x0149002Eu).kind == psprecomp::OpcodeKind::Msub, "MSUB decode failed");
+        require(psprecomp::decode_allegrex(0x000001CDu).kind == psprecomp::OpcodeKind::Break, "BREAK decode failed");
+        const auto vi2s = psprecomp::decode_allegrex(0xD03F8080u);  // vi2s.q
+        require(vi2s.kind == psprecomp::OpcodeKind::Vi2x && vi2s.mnemonic == std::string_view("vi2s"),
+                "VI2S decode failed");
         const auto jr = psprecomp::decode_allegrex(0x03E00008u);
         require(jr.kind == psprecomp::OpcodeKind::Jr && jr.has_delay_slot(), "JR decode failed");
         require(psprecomp::decode_allegrex(0xA6A200B0u).kind == psprecomp::OpcodeKind::Sh, "SH decode failed");
@@ -1441,6 +1451,37 @@ int main() {
                     std::bit_cast<std::uint32_t>(vx2i_result[3]) == 0xFFFF0000u,
                 "VS2I.P signed half expansion failed");
 
+        // VI2S.Q is the inverse of VS2I: re-pack the four expanded lanes.
+        vx2i_context.eat_vfpu_prefixes();
+        vx2i_context.execute_vfpu_vi2x(12u, 0u, 4u, 3u);
+        float vi2s_result[2]{};
+        vx2i_context.read_vfpu_vector(vi2s_result, 12u, 2u);
+        require(std::bit_cast<std::uint32_t>(vi2s_result[0]) == 0x7FFF8000u &&
+                    std::bit_cast<std::uint32_t>(vi2s_result[1]) == 0xFFFF0001u,
+                "VI2S.Q did not re-pack VS2I output");
+
+        psprecomp::AllegrexContext vi2x_context{};
+        vi2x_context.eat_vfpu_prefixes();
+        const float narrow_lanes[4]{
+            std::bit_cast<float>(0x7F800000u),  // VI2UC 0xFF, VI2C 0x7F, VI2US 0xFF00
+            std::bit_cast<float>(0x80000000u),  // negative: unsigned forms clamp to 0
+            std::bit_cast<float>(0x01000000u),
+            std::bit_cast<float>(0xFF000000u),
+        };
+        vi2x_context.write_vfpu_vector(narrow_lanes, 0u, 4u);
+        const auto narrow = [&](std::uint32_t operation, std::uint32_t length, std::uint32_t lane) {
+            vi2x_context.eat_vfpu_prefixes();
+            vi2x_context.execute_vfpu_vi2x(16u, 0u, length, operation);
+            float out[2]{};
+            vi2x_context.read_vfpu_vector(out, 16u, 2u);
+            return std::bit_cast<std::uint32_t>(out[lane]);
+        };
+        require(narrow(0u, 4u, 0u) == 0x000200FFu, "VI2UC.Q packing/clamping failed");
+        require(narrow(1u, 4u, 0u) == 0xFF01807Fu, "VI2C.Q packing failed");
+        require(narrow(2u, 4u, 0u) == 0x0000FF00u && narrow(2u, 4u, 1u) == 0x00000200u,
+                "VI2US.Q packing/clamping failed");
+        require(narrow(3u, 2u, 0u) == 0x80007F80u, "VI2S.P packing failed");
+
         vx2i_context.eat_vfpu_prefixes();
         vx2i_context.set_vfpu_scalar_bits(4u, 0xFF804020u);
         vx2i_context.execute_vfpu_vx2i(8u, 4u, 1u, 0u);
@@ -1677,6 +1718,18 @@ int main() {
         std::array<std::uint8_t, 6> mirror_copy{};
         segmented_memory.copy_out(0x045FFFFDu, mirror_copy);
         require(mirror_copy == mirror_payload, "PSP EDRAM mirrored bulk-copy wrap failed");
+
+        require(segmented_memory.contains(0x00010000u, psprecomp::GuestMemory::kScratchpadSize) &&
+                    !segmented_memory.contains(0x00013FFDu, 4u) &&
+                    !segmented_memory.contains(0x0000FFFCu, 4u),
+                "PSP scratchpad bounds are wrong");
+        segmented_memory.aot_store32(0x40010010u, 0x0BADF00Du);
+        require(segmented_memory.aot_load32(0x00010010u) == 0x0BADF00Du &&
+                    segmented_memory.load32(0x80010010u) == 0x0BADF00Du,
+                "PSP scratchpad cached/uncached aliasing failed");
+        require(segmented_memory.raw_pointer(0x00013FFCu, 4u) != nullptr &&
+                    segmented_memory.raw_pointer(0x00013FFCu, 8u) == nullptr,
+                "PSP scratchpad raw pointer bounds are wrong");
 
         {
             psprecomp::GuestMemory deflate_memory;

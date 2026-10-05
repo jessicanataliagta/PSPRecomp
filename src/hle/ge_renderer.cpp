@@ -1,8 +1,8 @@
-#include "ge_renderer.hpp"
-#include "ge_gpu_backend.hpp"
-#include "vcs_config.hpp"
-#include "vcs_project2dfx.hpp"
-#include "vcs_fps_overlay.hpp"
+// Moved from the VCS profile host (profiles/vcs/host/ge_renderer.cpp). Title
+// features (widescreen, overlays, camera taps) are reached through
+// g_ge_renderer_hooks; GPU work through the psprecomp::hle::gpu backend.
+#include "psprecomp/hle/ge_renderer.hpp"
+#include "psprecomp/hle/ge_gpu.hpp"
 
 #include "psprecomp/common.hpp"
 
@@ -32,7 +32,10 @@
 #define PSPRECOMP_GE_X86_SIMD 0
 #endif
 
-namespace vcs {
+namespace psprecomp::hle {
+using namespace gpu;
+
+GeRendererHooks g_ge_renderer_hooks{};
 
 namespace {
 
@@ -200,8 +203,8 @@ bool gpu_hardware_transform_enabled() noexcept {
     static const bool enabled = [] {
         const char *text = std::getenv("PSPRECOMP_GE_GPU_HW_TRANSFORM");
         if (text != nullptr && *text != '\0') return std::strcmp(text, "0") != 0;
-        const vcs::VcsConfiguration &config = vcs::vcs_configuration();
-        return config.initialized && config.rendering.hardware_transform;
+        return g_ge_renderer_hooks.hardware_transform_enabled != nullptr &&
+               g_ge_renderer_hooks.hardware_transform_enabled();
     }();
     return enabled;
 }
@@ -227,7 +230,9 @@ bool gpu_hardware_transform_enabled() noexcept {
 bool gpu_hardware_cull_enabled() noexcept {
     static const bool enabled = [] {
         const char *text = std::getenv("PSPRECOMP_GE_GPU_HW_CULL");
-        return text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0;
+        if (text != nullptr && *text != '\0') return std::strcmp(text, "0") != 0;
+        return g_ge_renderer_hooks.hardware_cull_enabled != nullptr &&
+               g_ge_renderer_hooks.hardware_cull_enabled();
     }();
     return enabled;
 }
@@ -533,80 +538,6 @@ float decode_float24(std::uint32_t data) noexcept {
 }
 }
 
-void reset_ge_transform_state(GeTransformState &state) noexcept {
-    state = GeTransformState{};
-    for (std::size_t bone = 0; bone < 8u; ++bone) {
-        const std::size_t base = bone * 12u;
-        state.bones[base + 0u] = 1.0f;
-        state.bones[base + 4u] = 1.0f;
-        state.bones[base + 8u] = 1.0f;
-    }
-    state.world[0] = state.world[4] = state.world[8] = 1.0f;
-    state.view[0] = state.view[4] = state.view[8] = 1.0f;
-    state.texture[0] = state.texture[4] = state.texture[8] = 1.0f;
-    state.projection[0] = state.projection[5] = state.projection[10] = state.projection[15] = 1.0f;
-    state.morph_weights[0] = 1.0f;
-}
-
-void update_ge_transform_state(GeTransformState &state, std::uint32_t command,
-                               std::uint32_t data) noexcept {
-    switch (command) {
-    case 0x2Au:
-        state.bone_cursor = data & 0x7Fu;
-        break;
-    case 0x2Bu: {
-        // The cursor is seven bits wide, but only 0..95 are backed by matrix
-        // storage. Reserved values 96..127 discard writes instead of wrapping
-        // through modulo 96 and corrupting the first bones.
-        const std::uint32_t index = state.bone_cursor & 0x7Fu;
-        if (index < state.bones.size()) state.bones[index] = decode_float24(data);
-        state.bone_cursor = (index + 1u) & 0x7Fu;
-        break;
-    }
-    case 0x2Cu: case 0x2Du: case 0x2Eu: case 0x2Fu:
-    case 0x30u: case 0x31u: case 0x32u: case 0x33u:
-        state.morph_weights[command - 0x2Cu] = decode_float24(data);
-        break;
-    case 0x3Au:
-        state.world_cursor = data & 0xFu;
-        break;
-    case 0x3Bu: {
-        const std::uint32_t index = state.world_cursor & 0xFu;
-        if (index < state.world.size()) state.world[index] = decode_float24(data);
-        state.world_cursor = (index + 1u) & 0xFu;
-        break;
-    }
-    case 0x3Cu:
-        state.view_cursor = data & 0xFu;
-        break;
-    case 0x3Du: {
-        const std::uint32_t index = state.view_cursor & 0xFu;
-        if (index < state.view.size()) state.view[index] = decode_float24(data);
-        state.view_cursor = (index + 1u) & 0xFu;
-        break;
-    }
-    case 0x3Eu:
-        state.projection_cursor = data & 0xFu;
-        break;
-    case 0x3Fu: {
-        const std::uint32_t index = state.projection_cursor & 0xFu;
-        state.projection[index] = decode_float24(data);
-        state.projection_cursor = (index + 1u) & 0xFu;
-        break;
-    }
-    case 0x40u:
-        state.texture_cursor = data & 0xFu;
-        break;
-    case 0x41u: {
-        const std::uint32_t index = state.texture_cursor & 0xFu;
-        if (index < state.texture.size()) state.texture[index] = decode_float24(data);
-        state.texture_cursor = (index + 1u) & 0xFu;
-        break;
-    }
-    default:
-        break;
-    }
-}
 
 namespace {
 
@@ -1897,9 +1828,8 @@ bool software_raster_skipped(const std::array<std::uint32_t, 256> &commands) noe
         // exposed that the old conservative policy still CPU-rasterized most
         // offscreen targets as well as submitting the same geometry to D3D12.
         // That double raster is unnecessary once DX12GEColor is enabled.
-        const VcsConfiguration &cfg = vcs_configuration();
-        return cfg.initialized && cfg.rendering.backend == RenderingBackend::DirectX12 &&
-               cfg.rendering.dx12_ge_color;
+        return g_ge_renderer_hooks.gpu_color_authoritative != nullptr &&
+               g_ge_renderer_hooks.gpu_color_authoritative();
     }();
     static const bool skip_owned = [] {
         const char *value = std::getenv("PSPRECOMP_GE_GPU_SKIP_OWNED_RASTER");
@@ -3716,7 +3646,11 @@ void rasterize_prepared_triangle_rows(psprecomp::GuestMemory &memory,
                 texture_denominator = l0 * a.q * a.inv_w + l1 * b.q * b.inv_w + l2 * c.q * c.inv_w;
                 if (!finite_float(texture_denominator) || std::fabs(texture_denominator) < 1.0e-20f) continue;
             }
-            const float z = l0 * a.z + l1 * b.z + l2 * c.z;
+            // Anchored on a.z so a constant-depth triangle yields exactly that
+            // depth: the barycentric sum l0+l1+l2 can land a hair under 1, and
+            // the truncating uint16 conversion then misses depth-EQUAL masks
+            // (CTW draws its radar map through a depth-written disc this way).
+            const float z = a.z + l1 * (b.z - a.z) + l2 * (c.z - a.z);
             if (triangle.early_depth &&
                 !fragment_depth_prepass(memory, setup, x, y, z, row_stats)) continue;
             float u = 0.0f;
@@ -4188,48 +4122,9 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
             gpu_draw.texture_content_signature = any_signature ? signature : 0u;
         }
         ge_gpu_backend_record_draw(gpu_draw);
-        if (!gpu_draw.through && !gpu_draw.clear_mode &&
-            primitive >= 3u && primitive <= 5u) {
-            const std::array<float, 6> cloud_viewport{
-                decode_float24(data24(commands[0x42u])),
-                decode_float24(data24(commands[0x43u])),
-                decode_float24(data24(commands[0x45u])),
-                decode_float24(data24(commands[0x46u])),
-                static_cast<float>(data24(commands[0x4Cu]) & 0xFFFFu) / 16.0f,
-                static_cast<float>(data24(commands[0x4Du]) & 0xFFFFu) / 16.0f};
-            // VCS' authoritative camera origin. The affine GE view used by
-            // individual passes is not guaranteed to encode this position as
-            // a rigid inverse (reflections and camera-relative passes do not),
-            // which made a world-space cloud slab orbit while only turning.
-            constexpr std::uint32_t kVcsCameraPosition = 0x08BC87E0u;
-            std::array<float, 3> cloud_camera_position{};
-            if (memory.contains(kVcsCameraPosition, 12u)) {
-                cloud_camera_position = {
-                    std::bit_cast<float>(memory.load32(kVcsCameraPosition + 0u)),
-                    std::bit_cast<float>(memory.load32(kVcsCameraPosition + 4u)),
-                    std::bit_cast<float>(memory.load32(kVcsCameraPosition + 8u))};
-            }
-            ge_gpu_backend_observe_camera(transform.view, transform.projection,
-                                          cloud_viewport, cloud_camera_position,
-                                          gpu_draw, count);
-        }
-        if (!gpu_draw.clear_mode && primitive >= 3u && primitive <= 6u)
-            fps_overlay_observe_draw(gpu_draw, count);
-        if (!gpu_draw.through && !gpu_draw.clear_mode &&
-            primitive >= 3u && primitive <= 5u &&
-            !project2dfx_observe_camera_hot(gpu_draw, count, camera_state_revision)) {
-            project2dfx_observe_camera(
-                transform.view, transform.projection,
-                decode_float24(data24(commands[0x42u])),
-                decode_float24(data24(commands[0x43u])),
-                decode_float24(data24(commands[0x44u])),
-                decode_float24(data24(commands[0x45u])),
-                decode_float24(data24(commands[0x46u])),
-                decode_float24(data24(commands[0x47u])),
-                static_cast<float>(data24(commands[0x4Cu]) & 0xFFFFu) / 16.0f,
-                static_cast<float>(data24(commands[0x4Du]) & 0xFFFFu) / 16.0f,
-                1.0f, gpu_draw, count, camera_state_revision);
-        }
+        if (g_ge_renderer_hooks.observe_gpu_draw != nullptr)
+            g_ge_renderer_hooks.observe_gpu_draw(memory, commands, transform, gpu_draw, primitive, count,
+                                                 camera_state_revision);
     }
     }
     const std::uint32_t isize = index_size(layout.index_type);
@@ -5037,4 +4932,4 @@ void reset_ge_phase_totals() noexcept {
     g_ge_vertex_count = 0u;
 }
 
-} // namespace vcs
+} // namespace psprecomp::hle

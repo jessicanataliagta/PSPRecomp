@@ -12,8 +12,40 @@
 namespace psprecomp {
 namespace {
 
+constexpr std::uint32_t kSectionProgbits = 1u;
+constexpr std::uint32_t kSectionFlagAlloc = 2u;
+constexpr std::uint32_t kSectionFlagExec = 4u;
+
+bool is_code_section(const ElfSection &section) noexcept {
+    return section.type == kSectionProgbits && section.size != 0u &&
+           (section.flags & (kSectionFlagAlloc | kSectionFlagExec)) == (kSectionFlagAlloc | kSectionFlagExec);
+}
+
+bool is_data_section(const ElfSection &section) noexcept {
+    return section.type == kSectionProgbits && section.size >= 4u &&
+           (section.flags & kSectionFlagAlloc) != 0u && (section.flags & kSectionFlagExec) == 0u;
+}
+
+bool has_code_sections(const Elf32Image &elf) {
+    return std::any_of(elf.sections().begin(), elf.sections().end(), is_code_section);
+}
+
 std::vector<ExecutableRange> executable_ranges_for(const Elf32Image &elf, std::uint32_t load_base) {
     std::vector<ExecutableRange> ranges;
+    // Section headers, when present, separate .text from the rodata/data that a
+    // single RWX segment may also carry; decoding those as code only produces
+    // garbage blocks.
+    if (has_code_sections(elf)) {
+        for (const auto &section : elf.sections()) {
+            if (!is_code_section(section)) continue;
+            const std::uint32_t start = elf.section_runtime_address(section, load_base);
+            const std::uint64_t end64 = static_cast<std::uint64_t>(start) + section.size;
+            if (end64 > std::numeric_limits<std::uint32_t>::max()) continue;
+            ranges.push_back({start, static_cast<std::uint32_t>(end64)});
+        }
+        std::sort(ranges.begin(), ranges.end(), [](const auto &a, const auto &b) { return a.start < b.start; });
+        return ranges;
+    }
     for (std::size_t i = 0; i < elf.segments().size(); ++i) {
         const auto &segment = elf.segments()[i];
         if (segment.type != 1u || (segment.flags & 1u) == 0u || segment.file_size == 0u) continue;
@@ -113,6 +145,7 @@ void propagate_constant(const DecodedInstruction &decoded,
     case OpcodeKind::Lui:
         set_constant_and_seed(constants, decoded.rt, uimm << 16u, seeds, ranges);
         break;
+    case OpcodeKind::Addi:  // same value as ADDIU whenever it does not trap
     case OpcodeKind::Addiu:
         set_constant_and_seed(constants, decoded.rt,
             lhs ? std::optional<std::uint32_t>(*lhs + static_cast<std::uint32_t>(simm)) : std::nullopt,
@@ -306,9 +339,67 @@ std::map<std::uint32_t, std::string> collect_initial_seeds(const Elf32Image &elf
     // R_MIPS_32 relocations are the authoritative source for function pointers
     // stored in read-only tables embedded in the executable segment (init arrays,
     // vtables, callbacks). Scanning raw RX words would confuse J opcodes with pointers.
+    bool has_r_mips32 = false;
     for (const auto &site : elf.relocation_sites(load_base)) {
         if (site.type != 2u || !memory.contains(site.patch_address, 4u)) continue;
+        has_r_mips32 = true;
         add_seed(seeds, ranges, memory.load32(site.patch_address), "relocated_r_mips32_code_pointer");
+    }
+    // A writable code section mixes code with data (overlay modules ship one
+    // RWX section), so its words are scanned like a data section: function
+    // pointers, vtables and switch jump tables all live there. A J instruction
+    // cannot alias such a pointer: J to an address in the code's 256 MiB
+    // region encodes as 0x08000000 | (target >> 2), far below the target itself.
+    if (has_code_sections(elf)) {
+        for (const auto &section : elf.sections()) {
+            if (!is_code_section(section) || (section.flags & 1u) == 0u) continue;
+            const std::uint32_t start = elf.section_runtime_address(section, load_base);
+            if (!memory.contains(start, section.size)) continue;
+            for (std::uint32_t offset = 0u; offset + 4u <= section.size; offset += 4u) {
+                const std::uint32_t target = memory.load32(start + offset);
+                if ((target & 3u) == 0u) add_seed(seeds, ranges, target, "mixed_section_code_pointer");
+            }
+        }
+    }
+    // With section headers, every allocated data section (rodata, data, ctor and
+    // init tables) is a candidate table of code pointers: function pointers,
+    // vtables and switch jump tables. Fixed-address executables carry no
+    // relocations to mark them, and they may share an RWX segment with .text.
+    if (has_code_sections(elf)) {
+        for (const auto &section : elf.sections()) {
+            if (!is_data_section(section)) continue;
+            const std::uint32_t start = elf.section_runtime_address(section, load_base);
+            if (!memory.contains(start, section.size)) continue;
+            const std::uint32_t size = section.size & ~3u;
+            for (std::uint32_t offset = 0u; offset < size; offset += 4u) {
+                const std::uint32_t target = memory.load32(start + offset);
+                if ((target & 3u) == 0u) add_seed(seeds, ranges, target, "section_data_code_pointer");
+            }
+        }
+        return seeds;
+    }
+    // Without sections or relocations, accept a raw executable-segment word only
+    // when it points at a function boundary: an `addiu $sp, $sp, -imm` prologue,
+    // or (for leaf functions without a frame) the instruction after the previous
+    // function's `jr $ra` + delay slot. A J opcode read as data almost never
+    // lands on one.
+    if (!has_r_mips32) {
+        for (std::size_t i = 0; i < elf.segments().size(); ++i) {
+            const auto &segment = elf.segments()[i];
+            if (segment.type != 1u || (segment.flags & 1u) == 0u || segment.file_size < 4u) continue;
+            const std::uint32_t start = elf.segment_runtime_address(i, load_base);
+            const std::uint32_t size = segment.file_size & ~3u;
+            for (std::uint32_t offset = 0u; offset < size; offset += 4u) {
+                const std::uint32_t target = memory.load32(start + offset);
+                if ((target & 3u) != 0u || !is_executable_address(ranges, target)) continue;
+                const std::uint32_t instruction = memory.load32(target);
+                const bool prologue = (instruction & 0xFFFF8000u) == 0x27BD8000u;
+                const bool after_return = is_executable_address(ranges, target - 8u) &&
+                                          memory.load32(target - 8u) == 0x03E00008u;  // jr $ra
+                if (!prologue && !after_return) continue;
+                add_seed(seeds, ranges, target, "executable_segment_code_pointer");
+            }
+        }
     }
     return seeds;
 }
@@ -407,13 +498,10 @@ bool is_executable_address(const std::vector<ExecutableRange> &ranges, std::uint
     return address >= range.start && address < range.end && (address & 3u) == 0u;
 }
 
-ProgramAnalysis analyze_program(const Elf32Image &elf,
-                                const GuestMemory &memory,
-                                std::uint32_t load_base,
-                                std::size_t max_instructions_per_function) {
-    ProgramAnalysis program{};
-    program.executable_ranges = executable_ranges_for(elf, load_base);
-    program.seeds = collect_initial_seeds(elf, memory, load_base, program.executable_ranges);
+namespace {
+
+void analyze_seeded_functions(ProgramAnalysis &program, const GuestMemory &memory,
+                              std::size_t max_instructions_per_function) {
     program.functions.reserve(program.seeds.size());
 
     std::unordered_map<std::uint32_t, std::size_t> label_owners;
@@ -429,6 +517,71 @@ ProgramAnalysis analyze_program(const Elf32Image &elf,
         }
         program.functions.push_back(std::move(function));
     }
+}
+
+} // namespace
+
+void collect_references_into(const Elf32Image &host, const GuestMemory &memory, std::uint32_t host_load_base,
+                             const std::vector<ExecutableRange> &overlay_ranges,
+                             std::map<std::uint32_t, std::string> &seeds) {
+    for (const auto &range : executable_ranges_for(host, host_load_base)) {
+        for (std::uint32_t pc = range.start; pc + 4u <= range.end; pc += 4u) {
+            const auto decoded = decode_allegrex(memory.load32(pc));
+            if (decoded.kind == OpcodeKind::Jal) {
+                add_seed(seeds, overlay_ranges, direct_jump_target(pc, decoded), "host_jal_target");
+                continue;
+            }
+            if (decoded.kind != OpcodeKind::Lui || decoded.rt == 0u) continue;
+            const std::uint32_t high = static_cast<std::uint32_t>(decoded.immediate) << 16u;
+            for (std::uint32_t next = pc + 4u; next < pc + 32u && next + 4u <= range.end; next += 4u) {
+                const auto low = decode_allegrex(memory.load32(next));
+                if ((low.kind == OpcodeKind::Addiu || low.kind == OpcodeKind::Ori) && low.rs == decoded.rt) {
+                    const std::uint32_t value = low.kind == OpcodeKind::Addiu
+                        ? high + static_cast<std::uint32_t>(static_cast<std::int32_t>(low.immediate))
+                        : high | static_cast<std::uint16_t>(low.immediate);
+                    add_seed(seeds, overlay_ranges, value, "host_materialized_pointer");
+                    break;
+                }
+            }
+        }
+    }
+    for (const auto &section : host.sections()) {
+        if (!is_data_section(section)) continue;
+        const std::uint32_t start = host.section_runtime_address(section, host_load_base);
+        if (!memory.contains(start, section.size)) continue;
+        for (std::uint32_t offset = 0u; offset + 4u <= section.size; offset += 4u) {
+            const std::uint32_t target = memory.load32(start + offset);
+            if ((target & 3u) == 0u) add_seed(seeds, overlay_ranges, target, "host_data_pointer");
+        }
+    }
+}
+
+std::vector<ExecutableRange> code_ranges(const Elf32Image &elf, std::uint32_t load_base) {
+    return executable_ranges_for(elf, load_base);
+}
+
+ProgramAnalysis analyze_program(const Elf32Image &elf,
+                                const GuestMemory &memory,
+                                std::uint32_t load_base,
+                                std::size_t max_instructions_per_function,
+                                const std::map<std::uint32_t, std::string> &extra_seeds) {
+    ProgramAnalysis program{};
+    program.executable_ranges = executable_ranges_for(elf, load_base);
+    program.seeds = collect_initial_seeds(elf, memory, load_base, program.executable_ranges);
+    for (const auto &[address, source] : extra_seeds) add_seed(program.seeds, program.executable_ranges, address, source.c_str());
+    analyze_seeded_functions(program, memory, max_instructions_per_function);
+    return program;
+}
+
+ProgramAnalysis analyze_overlay(const Elf32Image &overlay, const Elf32Image &host,
+                                const GuestMemory &memory, std::uint32_t host_load_base,
+                                std::size_t max_instructions_per_function) {
+    ProgramAnalysis program{};
+    program.executable_ranges = executable_ranges_for(overlay, 0u);
+    program.seeds = collect_initial_seeds(overlay, memory, 0u, program.executable_ranges);
+    program.seeds.erase(overlay.runtime_entry(0u));  // overlay ELFs carry no entry point
+    collect_references_into(host, memory, host_load_base, program.executable_ranges, program.seeds);
+    analyze_seeded_functions(program, memory, max_instructions_per_function);
     return program;
 }
 

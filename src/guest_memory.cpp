@@ -70,7 +70,7 @@ void log_write_watch(std::uint32_t address, std::size_t length, const char *oper
 }
 
 GuestMemory::GuestMemory(std::uint32_t size_bytes)
-    : vram_(kVramSize, 0u), bytes_(size_bytes, 0u), write_watch_enabled_(std::getenv("PSPRECOMP_WATCH_WRITE") != nullptr) {
+    : vram_(kVramSize, 0u), bytes_(size_bytes, 0u), scratchpad_(kScratchpadSize, 0u), write_watch_enabled_(std::getenv("PSPRECOMP_WATCH_WRITE") != nullptr) {
     if (size_bytes != 32u * 1024u * 1024u && size_bytes != 64u * 1024u * 1024u) {
         throw Error("PSP RAM size must be 32 MiB or 64 MiB");
     }
@@ -101,6 +101,8 @@ bool GuestMemory::contains(std::uint32_t address, std::size_t length) const noex
         return true;
     if (c >= kPhysicalBase && end <= static_cast<std::uint64_t>(kPhysicalBase) + bytes_.size())
         return true;
+    if (is_scratchpad_window(c) && end <= static_cast<std::uint64_t>(kScratchpadPhysicalBase) + kScratchpadSize)
+        return true;
     return false;
 }
 
@@ -111,14 +113,16 @@ GuestMemory::ResolvedAddress GuestMemory::resolve(std::uint32_t address, std::si
     const std::uint32_t c = canonical(address);
     if (is_vram_window(c))
         return {Region::Vram, vram_offset(c)};
+    if (is_scratchpad_window(c))
+        return {Region::Scratchpad, static_cast<std::size_t>(c - kScratchpadPhysicalBase)};
     return {Region::Ram, static_cast<std::size_t>(c - kPhysicalBase)};
 }
 
 const std::vector<std::uint8_t> &GuestMemory::region_bytes(Region region) const noexcept {
-    return region == Region::Vram ? vram_ : bytes_;
+    return region == Region::Vram ? vram_ : region == Region::Scratchpad ? scratchpad_ : bytes_;
 }
 std::vector<std::uint8_t> &GuestMemory::region_bytes(Region region) noexcept {
-    return region == Region::Vram ? vram_ : bytes_;
+    return region == Region::Vram ? vram_ : region == Region::Scratchpad ? scratchpad_ : bytes_;
 }
 
 // The `_slow` bodies below are the original aot_* implementations, reached only
@@ -297,6 +301,11 @@ const std::uint8_t *GuestMemory::raw_pointer(std::uint32_t address, std::size_t 
         // A run that would wrap past the end of the 2 MiB EDRAM image is not
         // contiguous in host memory even though it is legal in guest space.
         if (offset + length <= vram_.size()) return vram_.data() + offset;
+        return nullptr;
+    }
+    if (is_scratchpad_window(c)) {
+        const std::size_t offset = static_cast<std::size_t>(c - kScratchpadPhysicalBase);
+        if (offset + length <= scratchpad_.size()) return scratchpad_.data() + offset;
         return nullptr;
     }
     if (c < kPhysicalBase) return nullptr;

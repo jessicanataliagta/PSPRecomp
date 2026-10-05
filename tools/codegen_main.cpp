@@ -16,6 +16,7 @@
 #include <iostream>
 #include <iomanip>
 #include <map>
+#include <optional>
 #include <regex>
 #include <string_view>
 #include <set>
@@ -92,6 +93,14 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
     case psprecomp::OpcodeKind::Sync:
     case psprecomp::OpcodeKind::Cache:
         out << psprecomp::codegen::memory_ordering_statement(d.kind);
+        break;
+    case psprecomp::OpcodeKind::Addi:
+        // Trapping add-immediate: signed overflow raises the same exception as ADD.
+        out << "    { const std::int64_t addi_sum = static_cast<std::int64_t>(static_cast<std::int32_t>("
+            << reg(d.rs) << ")) + " << imm << ";\n"
+            << "      if (addi_sum < std::numeric_limits<std::int32_t>::min() || addi_sum > std::numeric_limits<std::int32_t>::max()) { rt.arithmetic_overflow("
+            << psprecomp::hex32(pc) << "u, " << psprecomp::hex32(d.word) << "u); return; }\n"
+            << "      ctx.set_gpr(" << d.rt << ", static_cast<std::uint32_t>(addi_sum)); }\n";
         break;
     case psprecomp::OpcodeKind::Addiu: out << "    ctx.set_gpr(" << d.rt << ", " << reg(d.rs) << " + static_cast<std::uint32_t>(" << imm << "));\n"; break;
     case psprecomp::OpcodeKind::Slti: out << "    ctx.set_gpr(" << d.rt << ", static_cast<std::int32_t>(" << reg(d.rs) << ") < " << imm << " ? 1u : 0u);\n"; break;
@@ -203,6 +212,24 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
         out << "    { const std::uint64_t product = static_cast<std::uint64_t>(" << reg(d.rs) << ") * static_cast<std::uint64_t>(" << reg(d.rt) << "); "
             << "ctx.lo = static_cast<std::uint32_t>(product); ctx.hi = static_cast<std::uint32_t>(product >> 32u); }\n";
         break;
+    case psprecomp::OpcodeKind::Madd:
+    case psprecomp::OpcodeKind::Msub: {
+        const char op = d.kind == psprecomp::OpcodeKind::Madd ? '+' : '-';
+        out << "    { const std::int64_t product = static_cast<std::int64_t>(static_cast<std::int32_t>(" << reg(d.rs) << ")) * "
+            << "static_cast<std::int64_t>(static_cast<std::int32_t>(" << reg(d.rt) << ")); "
+            << "const std::uint64_t accumulator = ((static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo) " << op
+            << " static_cast<std::uint64_t>(product); "
+            << "ctx.lo = static_cast<std::uint32_t>(accumulator); ctx.hi = static_cast<std::uint32_t>(accumulator >> 32u); }\n";
+        break;
+    }
+    case psprecomp::OpcodeKind::Maddu:
+    case psprecomp::OpcodeKind::Msubu: {
+        const char op = d.kind == psprecomp::OpcodeKind::Maddu ? '+' : '-';
+        out << "    { const std::uint64_t product = static_cast<std::uint64_t>(" << reg(d.rs) << ") * static_cast<std::uint64_t>(" << reg(d.rt) << "); "
+            << "const std::uint64_t accumulator = ((static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo) " << op << " product; "
+            << "ctx.lo = static_cast<std::uint32_t>(accumulator); ctx.hi = static_cast<std::uint32_t>(accumulator >> 32u); }\n";
+        break;
+    }
     case psprecomp::OpcodeKind::Div:
         // $zero is emitted as a literal 0u.  If it is also the divisor, do not
         // emit a syntactically present / or % expression at all: MSVC diagnoses
@@ -431,6 +458,12 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
         const std::uint32_t operation = (d.word >> 16u) & 3u;
         out << "    ctx.execute_vfpu_vx2i(" << destination << "u, " << source << "u, "
             << source_length << "u, " << operation << "u);\n";
+        break;
+    }
+    case psprecomp::OpcodeKind::Vi2x: {
+        const std::uint32_t size_code = ((d.word >> 7u) & 1u) | (((d.word >> 15u) & 1u) << 1u);
+        out << "    ctx.execute_vfpu_vi2x(" << (d.word & 0x7Fu) << "u, " << ((d.word >> 8u) & 0x7Fu) << "u, "
+            << (size_code + 1u) << "u, " << ((d.word >> 16u) & 3u) << "u);\n";
         break;
     }
     case psprecomp::OpcodeKind::Mtv:
@@ -846,8 +879,11 @@ std::string direct_unit_chain_expression(
                 psprecomp::hex32(target) + "u>(ctx, &aot_mem)";
         }
     }
-    return "rt.invoke_chained_direct<&" + generated_unit_cpp_name(unit) + ", " +
-        std::to_string(unit) + "u>(ctx, &aot_mem)";
+    // Every emitted entry has an id, so a target without one has no generated
+    // unit to name (e.g. a JAL past the end of the executable segment). Hand it
+    // to the generic per-PC dispatcher instead.
+    (void)unit;
+    return "(ctx.pc = " + psprecomp::hex32(target) + "u, rt.invoke_chained_call(ctx, &aot_mem))";
 }
 
 void emit_target(std::ostringstream &body, std::uint32_t target,
@@ -1056,7 +1092,9 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
                         if (target_is_import) {
                             body << "    ctx.pc = " << psprecomp::hex32(target) << "u;\n"
                                  << "    return;\n";
-                            continue;
+                            // The block ends here; `continue` would re-emit this
+                            // same PC forever.
+                            break;
                         }
                         // Otherwise run the callee inline and resume locally only
                         // if it came back to our return address.
@@ -1116,6 +1154,12 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
                 break;
             }
 
+            if (decoded.kind == psprecomp::OpcodeKind::Break) {
+                // GCC emits `break 7` after a zero-divisor check; reaching one is a guest fault.
+                body << "    rt.stop(\"Guest BREAK code " << ((decoded.word >> 6u) & 0xFFFFFu) << " at "
+                     << psprecomp::hex32(pc) << "\"); return;\n";
+                break;
+            }
             if (decoded.kind == psprecomp::OpcodeKind::Syscall ||
                 decoded.kind == psprecomp::OpcodeKind::Vfpu ||
                 decoded.kind == psprecomp::OpcodeKind::Unsupported) {
@@ -1432,10 +1476,21 @@ bool write_text_if_changed(const std::filesystem::path &path, const std::string 
     return true;
 }
 
+// Overlay mode: `elf_path` is the host executable, `overlay_path` a fixed-address
+// code overlay. Units are bucketed from the host's code base so they line up
+// with the host corpus, the host's import stubs are honoured, no import
+// wrappers are emitted, and everything is wrapped in `cpp_namespace`.
+struct OverlayOptions {
+    std::filesystem::path overlay_path;
+    std::string cpp_namespace;
+};
+
 int generate_auto(const std::filesystem::path &elf_path,
                   const std::filesystem::path &output_dir,
                   std::uint32_t load_base,
-                  std::uint32_t unit_span_bytes) {
+                  std::uint32_t unit_span_bytes,
+                  const OverlayOptions *overlay = nullptr,
+                  const std::vector<std::filesystem::path> &reference_overlays = {}) {
     const auto elf = psprecomp::Elf32Image::from_file(elf_path);
     psprecomp::GuestMemory memory;
     (void)elf.load_and_relocate(memory, load_base);
@@ -1443,11 +1498,35 @@ int generate_auto(const std::filesystem::path &elf_path,
     if (const auto module = elf.find_module_info(memory, load_base)) imports = elf.scan_imports(memory, *module);
     std::set<std::uint32_t> import_stubs;
     for (const auto &import : imports) import_stubs.insert(import.stub_address);
-    const auto program = psprecomp::analyze_program(elf, memory, load_base);
+    std::optional<psprecomp::Elf32Image> overlay_elf;
+    if (overlay != nullptr) {
+        overlay_elf.emplace(psprecomp::Elf32Image::from_file(overlay->overlay_path));
+        (void)overlay_elf->load_and_relocate(memory, 0u);
+    }
+    // Host functions that only overlays call are entry points too. Overlays may
+    // share addresses with each other, so each is loaded and scanned in turn;
+    // none overlaps the host's own code.
+    std::map<std::uint32_t, std::string> overlay_references;
+    if (!reference_overlays.empty()) {
+        const auto host_ranges = psprecomp::code_ranges(elf, load_base);
+        for (const auto &path : reference_overlays) {
+            const auto referencing = psprecomp::Elf32Image::from_file(path);
+            (void)referencing.load_and_relocate(memory, 0u);
+            psprecomp::collect_references_into(referencing, memory, 0u, host_ranges, overlay_references);
+        }
+        for (auto &[address, source] : overlay_references) source = "overlay_reference";
+    }
+    const auto program = overlay_elf ? psprecomp::analyze_overlay(*overlay_elf, elf, memory, load_base)
+                                     : psprecomp::analyze_program(elf, memory, load_base, 131072u, overlay_references);
     if (program.executable_ranges.empty()) throw psprecomp::Error("ELF has no executable ranges");
+    if (overlay_elf) imports.clear();  // the host corpus owns the import wrappers
 
     std::filesystem::create_directories(output_dir);
-    const std::uint32_t executable_base = program.executable_ranges.front().start;
+    const std::uint32_t executable_base = overlay_elf
+        ? psprecomp::code_ranges(elf, load_base).front().start
+        : program.executable_ranges.front().start;
+    const std::string ns_open = overlay != nullptr ? "namespace " + overlay->cpp_namespace + " {\n" : "";
+    const std::string ns_close = overlay != nullptr ? "} // namespace " + overlay->cpp_namespace + "\n" : "";
 
     // Emit every discovered guest instruction once. Function seeds remain analysis
     // metadata and dispatcher entries, but overlapping CFGs no longer duplicate C++.
@@ -1500,14 +1579,14 @@ int generate_auto(const std::filesystem::path &elf_path,
     // instead of forcing every known edge through a function-pointer branch.
     const auto units_header_path = output_dir / "generated_units.hpp";
     std::ostringstream units_header;
-    units_header << "#pragma once\n\n#include <cstdint>\n#include \"psprecomp/guest_memory.hpp\"\n\nnamespace psprecomp {\nclass Runtime;\nstruct AllegrexContext;\n";
+    units_header << "#pragma once\n\n#include <cstdint>\n#include \"psprecomp/guest_memory.hpp\"\n\nnamespace psprecomp {\nclass Runtime;\nstruct AllegrexContext;\n" << ns_open;
     for (const auto &unit : units) {
         units_header << "void " << generated_unit_cpp_name(unit.bucket)
                      << "(Runtime &, AllegrexContext &);\n";
         units_header << "void " << generated_unit_cpp_entry_name(unit.bucket)
                      << "(Runtime &, AllegrexContext &, std::uint16_t, GuestMemory::AotFastView &);\n";
     }
-    units_header << "} // namespace psprecomp\n";
+    units_header << ns_close << "} // namespace psprecomp\n";
     (void)write_text_if_changed(units_header_path, units_header.str());
 
     std::set<std::filesystem::path> expected_cpp;
@@ -1532,7 +1611,7 @@ int generate_auto(const std::filesystem::path &elf_path,
         };
 
         std::ostringstream out;
-        out << "#include \"psprecomp/runtime.hpp\"\n#include \"generated_units.hpp\"\n#include <bit>\n#include <cmath>\n#include <cstdint>\n#include <limits>\n\nnamespace psprecomp {\n";
+        out << "#include \"psprecomp/runtime.hpp\"\n#include \"generated_units.hpp\"\n#include <bit>\n#include <cmath>\n#include <cstdint>\n#include <limits>\n\nnamespace psprecomp {\n" << ns_open;
         // The register-cache lowering passes (per-basic-block GPR/FPR caches and
         // the cross-unit hot-register cache) are deliberately absent.  They kept
         // large numbers of guest registers live in C++ locals and in a second
@@ -1552,18 +1631,23 @@ int generate_auto(const std::filesystem::path &elf_path,
             << "u, &" << generated_unit.name << ", &"
             << generated_unit_cpp_entry_name(unit.bucket) << ");\n";
         for (const auto label : unit.entries) {
+            // Overlay entries get a namespaced name: anything not starting with
+            // "recomp_unit_" is non-chainable, so entering an overlay always passes
+            // the runtime's overlay resolver.
             out << "    runtime.register_function(" << psprecomp::hex32(label) << "u, &"
-                << generated_unit.name << ", \"" << generated_unit.name << "\");\n";
+                << generated_unit.name << ", \""
+                << (overlay != nullptr ? overlay->cpp_namespace + "::" : std::string{})
+                << generated_unit.name << "\");\n";
             ++registered_entries;
         }
-        out << "}\n} // namespace psprecomp\n";
+        out << "}\n" << ns_close << "} // namespace psprecomp\n";
         rewritten_units += write_text_if_changed(path, out.str()) ? 1u : 0u;
     }
 
     const auto registry_path = output_dir / "generated_registry.cpp";
     expected_cpp.insert(registry_path.filename());
     std::ostringstream registry;
-    registry << "#include \"psprecomp/runtime.hpp\"\n#include <cstdint>\n\nnamespace psprecomp {\n";
+    registry << "#include \"psprecomp/runtime.hpp\"\n#include <cstdint>\n\nnamespace psprecomp {\n" << ns_open;
     for (const auto &unit : units) registry << "void register_generated_unit_" << unit.bucket << "(Runtime &runtime);\n";
     registry << "\n";
     write_import_wrappers(registry, imports);
@@ -1574,7 +1658,7 @@ int generate_auto(const std::filesystem::path &elf_path,
                  << "u, &import_" << i << ", \"" << cpp_escape(imports[i].library)
                  << "::" << psprecomp::hex32(imports[i].nid) << "\");\n";
     }
-    registry << "}\n} // namespace psprecomp\n";
+    registry << "}\n" << ns_close << "} // namespace psprecomp\n";
     const bool registry_rewritten = write_text_if_changed(registry_path, registry.str());
 
     for (const auto &entry : std::filesystem::directory_iterator(output_dir)) {
@@ -1615,10 +1699,6 @@ int generate_auto(const std::filesystem::path &elf_path,
 int main(int argc, char **argv) {
     try {
         if (argc >= 4 && std::string_view(argv[2]) == "--auto") {
-            if (argc > 6) {
-                std::cerr << "Usage: psp_recomp <ELF> --auto <generated_dir> [load_base_hex] [unit_span_bytes]\n";
-                return 2;
-            }
             const std::uint32_t load_base = argc >= 5
                 ? static_cast<std::uint32_t>(std::stoul(argv[4], nullptr, 0))
                 : psprecomp::kDefaultPspUserLoadBase;
@@ -1626,12 +1706,34 @@ int main(int argc, char **argv) {
                 ? static_cast<std::uint32_t>(std::stoul(argv[5], nullptr, 0))
                 : 0x20000u;
             if (unit_span == 0u || (unit_span & 3u) != 0u) throw psprecomp::Error("unit_span_bytes must be non-zero and 4-byte aligned");
-            return generate_auto(argv[1], argv[3], load_base, unit_span);
+            // Any further arguments are overlay ELFs whose references into this
+            // executable seed its analysis.
+            std::vector<std::filesystem::path> reference_overlays;
+            for (int index = 6; index < argc; ++index) reference_overlays.emplace_back(argv[index]);
+            return generate_auto(argv[1], argv[3], load_base, unit_span, nullptr, reference_overlays);
+        }
+        if (argc >= 6 && std::string_view(argv[2]) == "--overlay") {
+            if (argc > 8) {
+                std::cerr << "Usage: psp_recomp <host ELF> --overlay <overlay ELF> <generated_dir> <c++ namespace> "
+                             "[host_load_base_hex] [unit_span_bytes]\n";
+                return 2;
+            }
+            const std::uint32_t load_base = argc >= 7
+                ? static_cast<std::uint32_t>(std::stoul(argv[6], nullptr, 0))
+                : psprecomp::kDefaultPspUserLoadBase;
+            const std::uint32_t unit_span = argc >= 8
+                ? static_cast<std::uint32_t>(std::stoul(argv[7], nullptr, 0))
+                : 0x20000u;
+            if (unit_span == 0u || (unit_span & 3u) != 0u) throw psprecomp::Error("unit_span_bytes must be non-zero and 4-byte aligned");
+            const OverlayOptions options{argv[3], argv[5]};
+            return generate_auto(argv[1], argv[4], load_base, unit_span, &options);
         }
         if (argc == 4) return generate_manual(argv[1], argv[2], argv[3]);
         std::cerr << "Usage:\n"
                   << "  psp_recomp <ELF> <functions.csv> <generated_manifest.cpp>\n"
-                  << "  psp_recomp <ELF> --auto <generated_dir> [load_base_hex] [unit_span_bytes]\n";
+                  << "  psp_recomp <ELF> --auto <generated_dir> [load_base_hex] [unit_span_bytes] [overlay ELF...]\n"
+                  << "  psp_recomp <host ELF> --overlay <overlay ELF> <generated_dir> <c++ namespace> "
+                     "[host_load_base_hex] [unit_span_bytes]\n";
         return 2;
     } catch (const std::exception &e) {
         std::cerr << "psp_recomp error: " << e.what() << "\n";

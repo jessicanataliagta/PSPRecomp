@@ -93,6 +93,26 @@ else()
     target_compile_options(psprecomp_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
 endif()
 
+# Generic PSP HLE shared by title profiles (kernel: threads, scheduler, sync
+# objects, partitions, file I/O, UMD, rtc, display, GE, audio, controller). Contains no game addresses.
+add_library(psprecomp_hle STATIC
+    src/hle/audio.cpp
+    src/hle/ctrl.cpp
+    src/hle/display.cpp
+    src/hle/ge.cpp
+    src/hle/ge_renderer.cpp
+    src/hle/io.cpp
+    src/hle/kernel.cpp
+    src/hle/system.cpp
+    src/hle/utility.cpp
+)
+target_link_libraries(psprecomp_hle PUBLIC psprecomp_core)
+target_compile_definitions(psprecomp_hle PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:_CRT_SECURE_NO_WARNINGS>)
+if(MSVC)
+    target_compile_options(psprecomp_hle PRIVATE /W4 /permissive- /EHsc ${PSPRECOMP_MSVC_MP_FLAG})
+endif()
+
 add_executable(psp_analyze tools/analyzer_main.cpp)
 target_link_libraries(psp_analyze PRIVATE psprecomp_core)
 
@@ -111,6 +131,35 @@ function(psprecomp_enable_host_avx target)
         target_compile_options(${target} PRIVATE /arch:AVX)
     endif()
 endfunction()
+
+# The GE software rasterizer previously built inside the VCS host target with
+# its AVX and /Ob3 settings; keep the same code generation for it here.
+psprecomp_enable_host_avx(psprecomp_hle)
+if(MSVC)
+    target_compile_options(psprecomp_hle PRIVATE $<$<CONFIG:Release>:/Ob3> $<$<CONFIG:RelWithDebInfo>:/Ob3>)
+endif()
+
+# GPU-backend entry points for profiles without a GPU backend: the software
+# rasterizer stays authoritative for every draw.
+add_library(psprecomp_hle_gpu_null STATIC src/hle/ge_gpu_null.cpp)
+target_link_libraries(psprecomp_hle_gpu_null PUBLIC psprecomp_hle)
+
+# Vulkan GE backend: replaces psprecomp_hle_gpu_null for profiles that render
+# on the GPU (src/hle/ge_gpu_vulkan.cpp). Optional: skipped without Vulkan.
+find_package(Vulkan QUIET)
+if(Vulkan_FOUND)
+    add_library(psprecomp_hle_gpu_vulkan STATIC src/hle/ge_gpu_vulkan.cpp)
+    target_link_libraries(psprecomp_hle_gpu_vulkan PUBLIC psprecomp_hle Vulkan::Vulkan)
+    psprecomp_enable_host_avx(psprecomp_hle_gpu_vulkan)
+endif()
+
+# sceAtrac3plus. Its sources compile inside the consuming target, which supplies
+# the FFmpeg headers and libraries (VCS vendors them; CTW uses the system ones).
+add_library(psprecomp_hle_atrac INTERFACE)
+target_sources(psprecomp_hle_atrac INTERFACE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/hle/atrac.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/hle/audio_stream_decoder.cpp")
+target_link_libraries(psprecomp_hle_atrac INTERFACE psprecomp_hle)
 
 if(PSPRECOMP_BUILD_TESTS)
     enable_testing()

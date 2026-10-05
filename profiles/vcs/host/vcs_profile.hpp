@@ -6,6 +6,9 @@
 
 namespace vcs {
 void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start);
+// Connects the shared GE renderer to the VCS configuration, DX12 backend and
+// camera/overlay taps (vcs_ge_integration.cpp).
+void install_ge_renderer_hooks();
 
 // Feeds the display window a dispatch/vblank heartbeat so long synchronous
 // guest phases still show progress instead of looking frozen.

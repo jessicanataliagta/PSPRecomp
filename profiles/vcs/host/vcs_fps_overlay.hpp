@@ -2,9 +2,13 @@
 
 #include <cstdint>
 
+namespace psprecomp::hle {
+struct GeGpuDrawDescriptor;
+}
+
 namespace vcs {
 
-struct GeGpuDrawDescriptor;
+using psprecomp::hle::GeGpuDrawDescriptor;
 
 // Records render targets touched during the current guest frame. The overlay
 // is emitted only when that same frame actually touched the displayed target,

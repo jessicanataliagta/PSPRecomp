@@ -135,7 +135,7 @@ set(VCS_HOST_SOURCES
     host/vcs_draw_distance_patch.cpp
     host/vcs_runtime_log.cpp
     ${VCS_HDR_POST_SOURCE}
-    host/ge_renderer.cpp
+    host/vcs_ge_integration.cpp
     ${VCS_GPU_BACKEND_SOURCE}
     host/dx12_presenter.cpp
 )
@@ -145,7 +145,7 @@ function(vcs_target_common target)
         "${VCS_PROFILE_DIR}/host"
         "${VCS_PROFILE_DIR}/generated"
         "${VCS_PROFILE_DIR}/third_party/ffmpeg/include")
-    target_link_libraries(${target} PRIVATE psprecomp_core ${CMAKE_DL_LIBS})
+    target_link_libraries(${target} PRIVATE psprecomp_hle_atrac psprecomp_hle psprecomp_core ${CMAKE_DL_LIBS})
     if(WIN32)
         foreach(VCS_FFMPEG_LIB avcodec avformat avutil swresample swscale)
             target_link_libraries(${target} PRIVATE

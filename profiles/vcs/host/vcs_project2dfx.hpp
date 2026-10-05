@@ -9,8 +9,12 @@ class Runtime;
 class GuestMemory;
 }
 
-namespace vcs {
+namespace psprecomp::hle {
 struct GeGpuDrawDescriptor;
+}
+
+namespace vcs {
+using psprecomp::hle::GeGpuDrawDescriptor;
 
 // Installs the complete VCS Project2DFX host port. Must be called after
 // register_generated_functions() so the optional guest-address hooks can replace

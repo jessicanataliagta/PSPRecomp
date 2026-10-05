@@ -33,6 +33,11 @@ SAVEDATA/
 /profiles/*/progress/
 /profiles/*/captures/
 
+# CTW's recompiled corpus is a translation of the game's own code: regenerate it
+# from your copy of the game (profiles/ctw/README.md) instead of publishing it.
+/profiles/ctw/generated/
+/profiles/ctw/generated_overlays/
+
 # Generated scratch output (the checked-in profile corpus is not ignored)
 *.generated
 *.tmp
@@ -50,3 +55,6 @@ SAVEDATA/
 # Python
 __pycache__/
 *.pyc
+
+# ctw_boot / VCSNative frame captures written to the working directory
+/captures/
