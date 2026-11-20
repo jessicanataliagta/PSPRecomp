@@ -10,9 +10,11 @@
 #include "ge_renderer.hpp"
 #include "ge_gpu_backend.hpp"
 #include "vcs_project2dfx.hpp"
+#include "vcs_runtime_log.hpp"
 
 #include "psprecomp/common.hpp"
 #include "psprecomp/deflate.hpp"
+#include "psprecomp/import_trace.hpp"
 
 #include <algorithm>
 #include <array>
@@ -456,7 +458,29 @@ struct DeferredIoResume {
     std::uint32_t handoff_pc{};
     std::uint32_t release_pc{};
     std::uint64_t observed_dispatches{};
+    // The world-stream commit boundaries are executed only by the thread that
+    // submitted the request (threadmain).  The scheduler may give the CPU to a
+    // different ready thread at the hand-off, so handoff_uid is not necessarily
+    // the submitter.  Those barriers therefore release on the boundary itself,
+    // whichever thread dispatches it; a barrier bound to the wrong thread could
+    // never release and left every later streaming wait hanging on a black screen.
+    bool any_thread_release{};
+    // Virtual PSP time when the barrier was armed, for the watchdog below.
+    std::uint64_t armed_virtual_time_us{};
+    // The UMD request the deferred worker was reading (diagnostics only).
+    std::uint32_t stream_request{};
 };
+
+// On the host a submitter commits within microseconds of guest time after the
+// hand-off.  A barrier still armed after this much PSP time is waiting for a
+// boundary that is not coming, and holding it would stall every later UMD read
+// for the rest of the session, so the watchdog releases it and logs why.
+constexpr std::uint64_t kDeferredIoWatchdogUs = 500'000u;
+// The same limit in outer dispatches, for runs with the execution-driven clock
+// disabled (PSPRECOMP_TIME_TICK_DISPATCHES=0), where virtual time stands still.
+constexpr std::uint64_t kDeferredIoWatchdogDispatches = 16'000'000u;
+std::uint64_t deferred_io_cross_thread_releases{};
+std::uint64_t deferred_io_watchdog_releases{};
 
 std::uint32_t io_handoff_release_pc(std::uint32_t handoff_pc) {
     switch (handoff_pc) {
@@ -465,6 +489,16 @@ std::uint32_t io_handoff_release_pc(std::uint32_t handoff_pc) {
     default: return handoff_pc;
     }
 }
+
+// The translated dispatches that start right after threadmain has stored the
+// active request (manager+0x274), cleared WorldStreamEventFlag and published
+// submission bit 0x4: the single and batched world-stream commit boundaries.
+bool is_world_stream_commit_pc(std::uint32_t pc) {
+    return pc == 0x08955EA4u || pc == 0x08956280u;
+}
+
+constexpr std::uint32_t kWorldStreamManager = 0x08E91200u;
+constexpr std::uint32_t kWorldStreamActiveOffset = 628u; // manager+0x274: active request
 
 // A very small host-backed read can finish before the allocating guest call has
 // unwound to 0x08955E7C/0x08956258.  In that case the currently restored
@@ -475,12 +509,10 @@ std::uint32_t io_handoff_release_pc(std::uint32_t handoff_pc) {
 // corresponding clear-event/set-0x4 transaction has committed.
 std::uint32_t uncommitted_world_stream_release_pc(psprecomp::Runtime &runtime,
                                                    std::uint32_t request) {
-    constexpr std::uint32_t world_stream_manager = 0x08E91200u;
-    constexpr std::uint32_t active_offset = 628u;
     if (request == 0u || !runtime.memory().contains(request, 52u) ||
-        !runtime.memory().contains(world_stream_manager + active_offset, 4u))
+        !runtime.memory().contains(kWorldStreamManager + kWorldStreamActiveOffset, 4u))
         return 0u;
-    if (runtime.memory().load32(world_stream_manager + active_offset) == request)
+    if (runtime.memory().load32(kWorldStreamManager + kWorldStreamActiveOffset) == request)
         return 0u; // already committed; ordinary per-read handoff is sufficient
     switch (runtime.memory().load32(request + 48u)) {
     case 0x08953990u: return 0x08955EA4u;
@@ -1304,6 +1336,9 @@ struct ControllerState {
 };
 ControllerState controller_state{};
 std::uint64_t display_vblank_index{};
+// Host time of the last sceDisplayWaitVblank*; the hang report uses it to spot a
+// main loop that has stopped presenting frames.
+std::chrono::steady_clock::time_point last_vblank_wait_wall{};
 
 // Stage 9 diagnostic guard.  Setting PSPRECOMP_TIME_TICK_DISPATCHES=0 is useful
 // for isolated scheduler/I/O ordering tests, but it deliberately disables the
@@ -3030,7 +3065,8 @@ bool delay_current_thread(psprecomp::Runtime &runtime, psprecomp::AllegrexContex
 bool defer_current_thread_for_io_handoff(psprecomp::Runtime &runtime,
                                           psprecomp::AllegrexContext &ctx,
                                           std::uint32_t return_value,
-                                          std::uint32_t release_pc_hint = 0u) {
+                                          std::uint32_t release_pc_hint = 0u,
+                                          std::uint32_t stream_request = 0u) {
     const std::int32_t worker_uid = thread_table.current_uid;
     auto worker = thread_table.threads.find(worker_uid);
     if (worker == thread_table.threads.end()) {
@@ -3060,8 +3096,17 @@ bool defer_current_thread_for_io_handoff(psprecomp::Runtime &runtime,
     const std::uint32_t release_pc = release_pc_hint != 0u
         ? release_pc_hint
         : io_handoff_release_pc(handoff_pc);
-    deferred_io_resumes[worker_uid] =
-        DeferredIoResume{thread_table.current_uid, handoff_pc, release_pc, 0u};
+    // The thread chosen above is simply the best ready thread.  When the barrier
+    // waits for a world-stream commit, only the submitter can satisfy it, so it
+    // must not be tied to whichever thread happened to run first.
+    DeferredIoResume barrier{};
+    barrier.handoff_uid = thread_table.current_uid;
+    barrier.handoff_pc = handoff_pc;
+    barrier.release_pc = release_pc;
+    barrier.any_thread_release = is_world_stream_commit_pc(release_pc);
+    barrier.armed_virtual_time_us = virtual_time_us;
+    barrier.stream_request = stream_request;
+    deferred_io_resumes[worker_uid] = barrier;
     refresh_vcs_post_dispatch_hook();
     if (std::getenv("PSPRECOMP_UMD_STREAM_DIAG") != nullptr ||
         std::getenv("PSPRECOMP_SCHED_DIAG") != nullptr) {
@@ -3071,6 +3116,8 @@ bool defer_current_thread_for_io_handoff(psprecomp::Runtime &runtime,
                   << " handoff_uid=" << thread_table.current_uid
                   << " handoff_pc=" << psprecomp::hex32(handoff_pc)
                   << " release_pc=" << psprecomp::hex32(release_pc)
+                  << " any_thread=" << (barrier.any_thread_release ? 1 : 0)
+                  << " request=" << psprecomp::hex32(stream_request)
                   << " result=" << return_value << "\n";
     }
     return true;
@@ -3780,6 +3827,54 @@ void vcs_post_chained_call_hook(psprecomp::Runtime &rt, psprecomp::AllegrexConte
               << "\n";
 }
 
+std::string deferred_io_thread_label(std::int32_t uid) {
+    const auto found = thread_table.threads.find(uid);
+    std::ostringstream out;
+    out << uid << ':' << (found != thread_table.threads.end() ? found->second.name : std::string("?"));
+    return out.str();
+}
+
+std::uint64_t deferred_io_held_us(const DeferredIoResume &barrier) {
+    return virtual_time_us >= barrier.armed_virtual_time_us
+        ? virtual_time_us - barrier.armed_virtual_time_us
+        : 0u;
+}
+
+bool deferred_io_barrier_expired(const DeferredIoResume &barrier) {
+    return deferred_io_held_us(barrier) >= kDeferredIoWatchdogUs ||
+           barrier.observed_dispatches >= kDeferredIoWatchdogDispatches;
+}
+
+// One line in VCSNative.log per unusual release, so a report from a player says
+// which path the UMD hand-off took without any diagnostic environment variable.
+void log_deferred_io_release(psprecomp::Runtime &rt, const char *kind, std::uint64_t count,
+                             std::int32_t worker_uid, const DeferredIoResume &barrier,
+                             std::uint32_t dispatch_pc, std::int32_t dispatch_thread_uid) {
+    std::ostringstream out;
+    out << "umd-handoff " << kind << " #" << count
+        << " worker=" << deferred_io_thread_label(worker_uid)
+        << " handoff=" << deferred_io_thread_label(barrier.handoff_uid)
+        << " handoff_pc=" << psprecomp::hex32(barrier.handoff_pc)
+        << " release_pc=" << psprecomp::hex32(barrier.release_pc)
+        << " released_by=" << deferred_io_thread_label(dispatch_thread_uid)
+        << " at_pc=" << psprecomp::hex32(dispatch_pc)
+        << " held_us=" << deferred_io_held_us(barrier)
+        << " dispatches=" << barrier.observed_dispatches;
+    if (barrier.stream_request != 0u && rt.memory().contains(barrier.stream_request, 52u)) {
+        out << " request=" << psprecomp::hex32(barrier.stream_request)
+            << " callback=" << psprecomp::hex32(rt.memory().load32(barrier.stream_request + 48u));
+    }
+    if (rt.memory().contains(kWorldStreamManager + kWorldStreamActiveOffset, 4u)) {
+        out << " world_active="
+            << psprecomp::hex32(rt.memory().load32(kWorldStreamManager + kWorldStreamActiveOffset));
+    }
+    vcs::runtime_log_line(out.str());
+    if (std::getenv("PSPRECOMP_UMD_STREAM_DIAG") != nullptr ||
+        std::getenv("PSPRECOMP_SCHED_DIAG") != nullptr) {
+        std::cerr << "[io-handoff] " << out.str() << "\n";
+    }
+}
+
 void vcs_post_dispatch_hook(psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx,
                             std::uint32_t dispatch_pc, std::int32_t dispatch_thread_uid) {
 
@@ -3854,8 +3949,28 @@ void vcs_post_dispatch_hook(psprecomp::Runtime &rt, psprecomp::AllegrexContext &
     completed.reserve(deferred_io_resumes.size());
     for (auto &[worker_uid, barrier] : deferred_io_resumes) {
         ++barrier.observed_dispatches;
-        if (dispatch_thread_uid == barrier.handoff_uid && dispatch_pc == barrier.release_pc)
+        const bool boundary_reached = dispatch_pc == barrier.release_pc &&
+            (barrier.any_thread_release || dispatch_thread_uid == barrier.handoff_uid);
+        if (boundary_reached) {
+            if (dispatch_thread_uid != barrier.handoff_uid) {
+                // Another thread ran first at the hand-off and the submitter
+                // committed later.  Matching only handoff_uid here used to leave
+                // the worker IoDeferred for the rest of the session.
+                const std::uint64_t count = ++deferred_io_cross_thread_releases;
+                if (count <= 8u || count % 1024u == 0u) {
+                    log_deferred_io_release(rt, "cross-thread-commit", count, worker_uid,
+                                            barrier, dispatch_pc, dispatch_thread_uid);
+                }
+            }
             completed.push_back(worker_uid);
+        } else if (deferred_io_barrier_expired(barrier)) {
+            const std::uint64_t count = ++deferred_io_watchdog_releases;
+            if (count <= 64u || count % 1024u == 0u) {
+                log_deferred_io_release(rt, "watchdog-release", count, worker_uid,
+                                        barrier, dispatch_pc, dispatch_thread_uid);
+            }
+            completed.push_back(worker_uid);
+        }
     }
     if (completed.empty()) return;
 
@@ -6906,6 +7021,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
         // wait only here before framebuffer presentation and vblank callbacks.
         if (!ge_async_wait_idle(rt)) return;
         ++display_vblank_index;
+        last_vblank_wait_wall = std::chrono::steady_clock::now();
         vcs::audio_output_advance(virtual_time_us);
         report_realtime_speed_if_requested();
         if (frame_time_diag_enabled()) {
@@ -9365,7 +9481,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
                 // PSPRECOMP_TIME_TICK_DISPATCHES=0 cannot strand the worker forever.
                 if (read != 0u) {
                     (void)defer_current_thread_for_io_handoff(
-                        rt, ctx, static_cast<std::uint32_t>(read), release_pc_hint);
+                        rt, ctx, static_cast<std::uint32_t>(read), release_pc_hint, stream_request);
                 } else {
                     ctx.set_gpr(2, 0u);
                 }
@@ -9406,7 +9522,266 @@ namespace {
 // and rough scale matter: every consumer compares relative deadlines.
 std::uint64_t starvation_tick_microseconds = 1u;
 
-void vcs_starvation_tick(psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+// ---------------------------------------------------------------------------
+// Hang report.  A game-level deadlock keeps the emulator alive while every PSP
+// thread waits on another, and nothing outside the process can see that.  The
+// report writes the whole scheduler state to VCSNative.log when the main loop
+// has not waited for vblank for kHangReportVblankStall, or when a file named
+// VCSNative.hang-report appears next to the executable (it is then deleted).
+constexpr std::uint32_t kVcsTextBegin = 0x08804000u;
+constexpr std::uint32_t kVcsTextEnd = 0x08804000u + 0x0036EF1Cu;
+constexpr auto kHangReportVblankStall = std::chrono::seconds(8);
+constexpr std::uint32_t kHangReportLimit = 16u;
+std::uint64_t hang_report_ticks{};
+std::chrono::steady_clock::time_point hang_report_last_check{};
+bool hang_report_vblank_stall_active{};
+std::uint32_t hang_reports_written{};
+
+const char *hang_report_import_name(std::string_view library, std::uint32_t nid) {
+    struct Name { std::uint32_t nid; const char *name; };
+    static constexpr Name thread_man[] = {
+        {0x446D8DE6u, "CreateThread"}, {0xF475845Du, "StartThread"}, {0xAA73C935u, "ExitThread"},
+        {0x809CE29Bu, "ExitDeleteThread"}, {0xCEADEB47u, "DelayThread"}, {0x68DA9E36u, "DelayThreadCB"},
+        {0x9ACE131Eu, "SleepThread"}, {0x82826F70u, "SleepThreadCB"}, {0xD59EAD2Fu, "WakeupThread"},
+        {0x278C0DF5u, "WaitThreadEnd"}, {0x293B45B8u, "GetThreadId"}, {0x71BC9871u, "ChangeThreadPriority"},
+        {0x9944F31Fu, "SuspendThread"}, {0x75156E8Fu, "ResumeThread"}, {0xD6DA4BA1u, "CreateSema"},
+        {0x3F53E640u, "SignalSema"}, {0x4E3A1105u, "WaitSema"}, {0x6D212BACu, "WaitSemaCB"},
+        {0x58B1F937u, "PollSema"}, {0x55C20A00u, "CreateEventFlag"}, {0x1FB15A32u, "SetEventFlag"},
+        {0x812346E4u, "ClearEventFlag"}, {0x402FCF22u, "WaitEventFlag"}, {0x328C546Au, "WaitEventFlagCB"},
+        {0x30FD48F0u, "PollEventFlag"}, {0x369ED59Du, "GetSystemTimeLow"}, {0x82BC5777u, "GetSystemTimeWide"},
+        {0xDB738F35u, "GetSystemTime"}, {0x349D6D6Cu, "CheckCallback"},
+    };
+    static constexpr Name display[] = {
+        {0x984C27E7u, "WaitVblankStart"}, {0x46F186C3u, "WaitVblankStartCB"}, {0x36CDFADEu, "WaitVblank"},
+        {0x8EB9EC49u, "WaitVblankCB"}, {0x289D82FEu, "SetFrameBuf"}, {0x9C6EAAD7u, "GetVcount"},
+    };
+    static constexpr Name utility[] = {
+        {0x50C4CD57u, "SavedataInitStart"}, {0xD4B95FFBu, "SavedataUpdate"},
+        {0x8874DBE0u, "SavedataGetStatus"}, {0x9790B33Cu, "SavedataShutdownStart"},
+    };
+    static constexpr Name io[] = {
+        {0x109F50BCu, "Open"}, {0x6A638D83u, "Read"}, {0x42EC03ACu, "Write"}, {0x27EB27B8u, "Lseek"},
+        {0x68963324u, "Lseek32"}, {0x810C4BC3u, "Close"}, {0x54F5FB11u, "Devctl"}, {0xACE946E8u, "Getstat"},
+        {0xB29DDF9Cu, "Dopen"}, {0xE3EB004Cu, "Dread"}, {0xEB092469u, "Dclose"},
+    };
+    static constexpr Name ge[] = {
+        {0xAB49E76Au, "ListEnQueue"}, {0x1C0D95A6u, "ListEnQueueHead"}, {0x03444EB4u, "ListSync"},
+        {0xB287BD61u, "DrawSync"}, {0xE0D68148u, "ListUpdateStallAddr"},
+    };
+    const auto find = [nid](const auto &table) -> const char * {
+        for (const Name &item : table)
+            if (item.nid == nid) return item.name;
+        return nullptr;
+    };
+    if (library == "ThreadManForUser") return find(thread_man);
+    if (library == "sceDisplay") return find(display);
+    if (library == "sceUtility") return find(utility);
+    if (library == "IoFileMgrForUser") return find(io);
+    if (library == "sceGe_user") return find(ge);
+    return nullptr;
+}
+
+std::string hang_report_thread_label(std::int32_t uid) {
+    const auto found = thread_table.threads.find(uid);
+    return std::to_string(uid) + ':' + (found != thread_table.threads.end() ? found->second.name : std::string("?"));
+}
+
+std::string hang_report_wait(std::int32_t uid) {
+    std::ostringstream out;
+    for (const auto &[semaphore_uid, semaphore] : semaphore_table.semaphores) {
+        for (const SemaphoreWaiter &waiter : semaphore.waiters) {
+            if (waiter.uid != uid) continue;
+            out << "semaphore " << semaphore_uid << " \"" << semaphore.name << "\" count="
+                << semaphore.count << '/' << semaphore.maximum << " want=" << waiter.requested;
+            return out.str();
+        }
+    }
+    for (const auto &[flag_uid, flag] : event_flag_table.flags) {
+        for (const EventFlagWaiter &waiter : flag.waiters) {
+            if (waiter.uid != uid) continue;
+            out << "eventflag " << flag_uid << " \"" << flag.name << "\" pattern="
+                << psprecomp::hex32(flag.current_pattern) << " want=" << psprecomp::hex32(waiter.requested)
+                << " mode=" << waiter.mode;
+            return out.str();
+        }
+    }
+    for (const auto &[target, waiters] : thread_table.thread_end_waiters) {
+        for (const ThreadContinuation &waiter : waiters) {
+            if (waiter.uid == uid) return "end of thread " + hang_report_thread_label(target);
+        }
+    }
+    return {};
+}
+
+// Return addresses found on a guest stack above sp: words inside the text
+// segment that follow a jal/jalr.  Stale frames can appear, but the first few
+// entries are a good approximation of the current call chain.
+std::string hang_report_guest_stack(psprecomp::Runtime &rt, const ThreadRecord &thread, std::uint32_t sp) {
+    if (sp == 0u || thread.stack_top <= sp) return {};
+    std::ostringstream out;
+    const std::uint32_t end = std::min<std::uint32_t>(thread.stack_top, sp + 0x2000u);
+    unsigned found = 0u;
+    for (std::uint32_t address = sp & ~3u; address + 4u <= end && found < 14u; address += 4u) {
+        if (!rt.memory().contains(address, 4u)) break;
+        const std::uint32_t word = rt.memory().load32(address);
+        if (word < kVcsTextBegin + 8u || word >= kVcsTextEnd || (word & 3u) != 0u) continue;
+        const std::uint32_t call = rt.memory().load32(word - 8u);
+        const bool jal = (call >> 26) == 3u;
+        const bool jalr = (call & 0xFC00003Fu) == 0x00000009u;
+        if (!jal && !jalr) continue;
+        out << ' ' << psprecomp::hex32(word);
+        ++found;
+    }
+    return out.str();
+}
+
+void write_hang_report(psprecomp::Runtime &rt, const psprecomp::AllegrexContext &ctx, const char *reason) {
+    if (hang_reports_written >= kHangReportLimit) return;
+    ++hang_reports_written;
+    const auto log = [](const std::string &line) { vcs::runtime_log_line("hang-report " + line); };
+    {
+        std::ostringstream out;
+        out << "begin #" << hang_reports_written << " reason=" << reason
+            << " vblank=" << display_vblank_index << " virtual_time_us=" << virtual_time_us
+            << " current=" << hang_report_thread_label(thread_table.current_uid)
+            << " ready=" << thread_table.continuations.size()
+            << " deferred_io=" << deferred_io_resumes.size()
+            << " io_cross_thread=" << deferred_io_cross_thread_releases
+            << " io_watchdog=" << deferred_io_watchdog_releases
+            << " threads=" << thread_table.threads.size()
+            << " stack_headroom=" << psprecomp::hex32(
+                   thread_table.next_stack_top > partition_table.next_address
+                       ? thread_table.next_stack_top - partition_table.next_address : 0u)
+            << " free_stacks=" << thread_table.free_stacks.size();
+        log(out.str());
+    }
+
+    std::vector<std::int32_t> uids;
+    for (const auto &[uid, unused] : thread_table.threads) {
+        (void)unused;
+        uids.push_back(uid);
+    }
+    std::sort(uids.begin(), uids.end());
+    for (const std::int32_t uid : uids) {
+        const ThreadRecord &thread = thread_table.threads.at(uid);
+        const bool current = uid == thread_table.current_uid;
+        const psprecomp::AllegrexContext &state = current ? ctx : thread.suspended_context;
+        std::ostringstream out;
+        out << "thread " << uid << ":\"" << thread.name << "\" prio=" << thread.priority
+            << " state=" << (current ? "Current" : thread_state_name(thread.state))
+            << (thread.externally_suspended ? " suspended" : "")
+            << " pc=" << psprecomp::hex32(state.pc) << " ra=" << psprecomp::hex32(state.gpr[31])
+            << " sp=" << psprecomp::hex32(state.gpr[29])
+            << " a0=" << psprecomp::hex32(state.gpr[4]) << " a1=" << psprecomp::hex32(state.gpr[5])
+            << " a2=" << psprecomp::hex32(state.gpr[6]) << " v0=" << psprecomp::hex32(state.gpr[2]);
+        if (thread.state == ThreadState::Delayed)
+            out << " delay_until=" << thread.delay_until_us;
+        if (thread.wakeup_count != 0u) out << " wakeups=" << thread.wakeup_count;
+        if (const std::string wait = hang_report_wait(uid); !wait.empty()) out << " wait=[" << wait << ']';
+        if (thread.state != ThreadState::Created && thread.state != ThreadState::Completed)
+            out << " stack=" << hang_report_guest_stack(rt, thread, state.gpr[29]);
+        log(out.str());
+    }
+    for (const ThreadContinuation &ready : thread_table.continuations) {
+        log("ready " + hang_report_thread_label(ready.uid) + " pc=" + psprecomp::hex32(ready.context.pc) +
+            " seq=" + std::to_string(ready.ready_sequence));
+    }
+    for (const auto &[worker_uid, barrier] : deferred_io_resumes) {
+        std::ostringstream out;
+        out << "io-barrier worker=" << hang_report_thread_label(worker_uid)
+            << " handoff=" << hang_report_thread_label(barrier.handoff_uid)
+            << " release_pc=" << psprecomp::hex32(barrier.release_pc)
+            << " any_thread=" << (barrier.any_thread_release ? 1 : 0)
+            << " dispatches=" << barrier.observed_dispatches;
+        log(out.str());
+    }
+    for (const auto &[uid, semaphore] : semaphore_table.semaphores) {
+        if (semaphore.waiters.empty()) continue;
+        std::ostringstream out;
+        out << "semaphore " << uid << " \"" << semaphore.name << "\" count=" << semaphore.count << '/'
+            << semaphore.maximum << " waiters=";
+        for (const SemaphoreWaiter &waiter : semaphore.waiters) out << hang_report_thread_label(waiter.uid) << ' ';
+        log(out.str());
+    }
+    for (const auto &[uid, flag] : event_flag_table.flags) {
+        std::ostringstream out;
+        out << "eventflag " << uid << " \"" << flag.name << "\" pattern=" << psprecomp::hex32(flag.current_pattern)
+            << " waiters=";
+        for (const EventFlagWaiter &waiter : flag.waiters)
+            out << hang_report_thread_label(waiter.uid) << "(want " << psprecomp::hex32(waiter.requested) << ") ";
+        log(out.str());
+    }
+    {
+        std::ostringstream out;
+        out << "savedata status=" << static_cast<std::uint32_t>(savedata_utility.status)
+            << " complete=" << (savedata_utility.operation_complete ? 1 : 0)
+            << " param=" << psprecomp::hex32(savedata_utility.parameter_address);
+        if (savedata_utility.parameter_address != 0u &&
+            rt.memory().contains(savedata_utility.parameter_address, kSavedataParameterMinimumSize)) {
+            out << " mode=" << rt.memory().load32(savedata_utility.parameter_address + kSavedataModeOffset)
+                << " result=" << psprecomp::hex32(rt.memory().load32(
+                       savedata_utility.parameter_address + kUtilityCommonResultOffset));
+        }
+        log(out.str());
+    }
+    if (rt.memory().contains(kWorldStreamManager + 600u, 64u)) {
+        std::ostringstream out;
+        out << "world-stream mgr+600..663:";
+        for (std::uint32_t offset = 600u; offset < 664u; offset += 4u)
+            out << ' ' << psprecomp::hex32(rt.memory().load32(kWorldStreamManager + offset));
+        log(out.str());
+    }
+    {
+        // The last calls, consecutive repeats from the same caller folded.
+        const std::vector<psprecomp::ImportTraceEntry> calls = psprecomp::recent_import_calls();
+        std::ostringstream out;
+        std::size_t index = calls.size() > 96u ? calls.size() - 96u : 0u;
+        for (; index < calls.size();) {
+            const psprecomp::ImportTraceEntry &call = calls[index];
+            std::size_t repeat = 1u;
+            while (index + repeat < calls.size() && calls[index + repeat].thread_uid == call.thread_uid &&
+                   calls[index + repeat].nid == call.nid &&
+                   calls[index + repeat].return_address == call.return_address)
+                ++repeat;
+            const char *name = hang_report_import_name(call.library, call.nid);
+            out << ' ' << call.thread_uid << ':' << call.library << "::"
+                << (name != nullptr ? name : psprecomp::hex32(call.nid))
+                << '@' << psprecomp::hex32(call.return_address);
+            if (repeat > 1u) out << 'x' << repeat;
+            index += repeat;
+        }
+        log("recent-imports" + out.str());
+    }
+    log("end");
+}
+
+void maybe_write_hang_report(psprecomp::Runtime &rt, const psprecomp::AllegrexContext &ctx) {
+    if ((++hang_report_ticks & 63u) != 0u) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - hang_report_last_check < std::chrono::seconds(1)) return;
+    hang_report_last_check = now;
+
+    const ::vcs::VcsConfiguration &config = ::vcs::vcs_configuration();
+    if (config.initialized && !config.executable_directory.empty()) {
+        const std::filesystem::path request = config.executable_directory / "VCSNative.hang-report";
+        std::error_code error;
+        if (std::filesystem::exists(request, error)) {
+            std::filesystem::remove(request, error);
+            write_hang_report(rt, ctx, "requested");
+        }
+    }
+
+    if (last_vblank_wait_wall == std::chrono::steady_clock::time_point{}) return;
+    if (now - last_vblank_wait_wall < kHangReportVblankStall) {
+        hang_report_vblank_stall_active = false;
+    } else if (!hang_report_vblank_stall_active) {
+        hang_report_vblank_stall_active = true;
+        write_hang_report(rt, ctx, "no-vblank-8s");
+    }
+}
+
+void vcs_starvation_tick(psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+    maybe_write_hang_report(rt, ctx);
     virtual_time_us += starvation_tick_microseconds;
     promote_expired_delays();
 
@@ -10034,6 +10409,212 @@ bool run_profile_self_tests(std::string &error) {
                                         io_runtime.memory().load32(event_pattern_slot) | 0x1u);
             require(io_runtime.memory().load32(event_pattern_slot) == 0x5u,
                     "tiny request completion bit was lost after the final commit");
+            file_table = FileTable{};
+        }
+
+        // The hand-off goes to the best ready thread, which need not be the
+        // submitter.  Here a third thread that outranks threadmain is ready when
+        // the worker's read completes, so it runs first.  The world-stream barrier
+        // must still release when threadmain later commits its submission: bound
+        // to the hand-off thread, the worker stayed IoDeferred for the rest of the
+        // session and every streaming wait after it hung on a black screen.
+        {
+            psprecomp::Runtime io_runtime;
+            install_profile(io_runtime, 0x08E00000u);
+            thread_table = ThreadTable{};
+            deferred_io_resumes.clear();
+            pending_guest_callbacks.clear();
+            async_return_frames.clear();
+            virtual_time_us = 0u;
+            deferred_io_cross_thread_releases = 0u;
+            deferred_io_watchdog_releases = 0u;
+
+            constexpr std::int32_t submitter_uid = 3;
+            constexpr std::int32_t worker_uid = 5;
+            constexpr std::int32_t other_uid = 9;
+            constexpr std::int32_t fd = 44;
+            constexpr std::uint32_t destination = 0x0882C000u;
+            constexpr std::uint32_t byte_count = 272u;
+            constexpr std::uint32_t allocator_unlock_pc = 0x08939C4Cu;
+            constexpr std::uint32_t batch_submit_pc = 0x08956258u;
+            constexpr std::uint32_t batch_commit_pc = 0x08956280u;
+            constexpr std::uint32_t worker_return_pc = 0x0893A48Cu;
+            constexpr std::uint32_t other_pc = 0x08AAB000u;
+            constexpr std::uint32_t umd_manager = 0x08E8F000u;
+            constexpr std::uint32_t request_pointer = 0x08E90C68u;
+            constexpr std::uint32_t active_slot = kWorldStreamManager + kWorldStreamActiveOffset;
+
+            ThreadRecord submitter{};
+            submitter.name = "threadmain";
+            submitter.priority = 56u;
+            submitter.state = ThreadState::Ready;
+            thread_table.threads.emplace(submitter_uid, std::move(submitter));
+            psprecomp::AllegrexContext submitter_context{};
+            submitter_context.pc = allocator_unlock_pc;
+            enqueue_continuation(submitter_uid, submitter_context);
+
+            ThreadRecord other{};
+            other.name = "higher-priority-ready-thread";
+            other.priority = 40u;
+            other.state = ThreadState::Ready;
+            thread_table.threads.emplace(other_uid, std::move(other));
+            psprecomp::AllegrexContext other_context{};
+            other_context.pc = other_pc;
+            enqueue_continuation(other_uid, other_context);
+
+            ThreadRecord worker{};
+            worker.name = "UmdStreamThread";
+            worker.priority = 32u;
+            worker.state = ThreadState::Running;
+            thread_table.threads.emplace(worker_uid, std::move(worker));
+            thread_table.current_uid = worker_uid;
+            psprecomp::set_runtime_thread_identity(worker_uid, "UmdStreamThread");
+
+            file_table.virtual_disc_handles.emplace(fd, VirtualDiscHandle{0u, byte_count, 0u});
+            io_runtime.memory().store32(umd_manager + 6916u, request_pointer);
+            io_runtime.memory().store32(request_pointer + 16u, 0x08E8F708u);
+            io_runtime.memory().store32(request_pointer + 20u, 997376u);
+            io_runtime.memory().store32(request_pointer + 24u, byte_count);
+            io_runtime.memory().store32(request_pointer + 28u, 0u);
+            io_runtime.memory().store32(request_pointer + 48u, 0x089539CCu);
+            io_runtime.memory().store32(active_slot, 0u);
+
+            psprecomp::AllegrexContext read_context{};
+            read_context.set_gpr(4u, static_cast<std::uint32_t>(fd));
+            read_context.set_gpr(5u, destination);
+            read_context.set_gpr(6u, byte_count);
+            read_context.set_gpr(22u, umd_manager);
+            read_context.set_gpr(31u, worker_return_pc);
+            io_runtime.invoke_import("IoFileMgrForUser", 0x6A638D83u, read_context);
+
+            require(!io_runtime.stopped(), "cross-thread UMD read stopped the runtime");
+            require(thread_table.current_uid == other_uid && read_context.pc == other_pc,
+                    "UMD hand-off did not run the highest-priority ready thread first");
+            require(deferred_io_resumes.contains(worker_uid) &&
+                        deferred_io_resumes.at(worker_uid).handoff_uid == other_uid &&
+                        deferred_io_resumes.at(worker_uid).release_pc == batch_commit_pc &&
+                        deferred_io_resumes.at(worker_uid).any_thread_release &&
+                        deferred_io_resumes.at(worker_uid).stream_request == request_pointer,
+                    "world-stream barrier was not armed on the commit boundary itself");
+
+            // The other thread runs and blocks again; threadmain resumes inside the
+            // allocator and works its way to the batched commit.
+            vcs_post_dispatch_hook(io_runtime, read_context, other_pc, other_uid);
+            thread_table.threads.at(other_uid).state = ThreadState::Sleeping;
+            require(activate_next_thread(read_context, "test-other-thread-blocks") &&
+                        thread_table.current_uid == submitter_uid &&
+                        read_context.pc == allocator_unlock_pc,
+                    "threadmain did not resume after the higher-priority thread blocked");
+            vcs_post_dispatch_hook(io_runtime, read_context, allocator_unlock_pc, submitter_uid);
+            io_runtime.memory().store32(active_slot, request_pointer);
+            vcs_post_dispatch_hook(io_runtime, read_context, batch_submit_pc, submitter_uid);
+            require(deferred_io_resumes.contains(worker_uid) &&
+                        thread_table.threads.at(worker_uid).state == ThreadState::IoDeferred,
+                    "UMD worker escaped before threadmain committed the batched submission");
+
+            vcs_post_dispatch_hook(io_runtime, read_context, batch_commit_pc, submitter_uid);
+            require(!deferred_io_resumes.contains(worker_uid) &&
+                        thread_table.current_uid == worker_uid &&
+                        read_context.pc == worker_return_pc &&
+                        read_context.gpr[2] == byte_count,
+                    "UMD worker stayed deferred after threadmain committed (hand-off went to another thread)");
+            require(deferred_io_cross_thread_releases == 1u && deferred_io_watchdog_releases == 0u,
+                    "cross-thread world-stream commit was not counted exactly once");
+            file_table = FileTable{};
+        }
+
+        // A barrier whose release boundary never runs must not hold the UMD
+        // worker forever.  The watchdog releases it after kDeferredIoWatchdogUs of
+        // PSP time (or kDeferredIoWatchdogDispatches with the clock disabled).
+        {
+            psprecomp::Runtime io_runtime;
+            install_profile(io_runtime, 0x08E00000u);
+            thread_table = ThreadTable{};
+            deferred_io_resumes.clear();
+            pending_guest_callbacks.clear();
+            async_return_frames.clear();
+            virtual_time_us = 0u;
+            deferred_io_cross_thread_releases = 0u;
+            deferred_io_watchdog_releases = 0u;
+
+            constexpr std::int32_t submitter_uid = 3;
+            constexpr std::int32_t worker_uid = 5;
+            constexpr std::int32_t fd = 45;
+            constexpr std::uint32_t destination = 0x0882E000u;
+            constexpr std::uint32_t byte_count = 272u;
+            constexpr std::uint32_t submitter_pc = 0x08939C4Cu;
+            constexpr std::uint32_t unrelated_pc = 0x08801234u;
+            constexpr std::uint32_t worker_return_pc = 0x0893A48Cu;
+            constexpr std::uint32_t umd_manager = 0x08E8F000u;
+            constexpr std::uint32_t request_pointer = 0x08E90C68u;
+            constexpr std::uint32_t active_slot = kWorldStreamManager + kWorldStreamActiveOffset;
+
+            ThreadRecord submitter{};
+            submitter.name = "threadmain";
+            submitter.priority = 56u;
+            submitter.state = ThreadState::Ready;
+            thread_table.threads.emplace(submitter_uid, std::move(submitter));
+            psprecomp::AllegrexContext submitter_context{};
+            submitter_context.pc = submitter_pc;
+            enqueue_continuation(submitter_uid, submitter_context);
+
+            ThreadRecord worker{};
+            worker.name = "UmdStreamThread";
+            worker.priority = 32u;
+            worker.state = ThreadState::Running;
+            thread_table.threads.emplace(worker_uid, std::move(worker));
+            thread_table.current_uid = worker_uid;
+            psprecomp::set_runtime_thread_identity(worker_uid, "UmdStreamThread");
+
+            file_table.virtual_disc_handles.emplace(fd, VirtualDiscHandle{0u, byte_count, 0u});
+            io_runtime.memory().store32(umd_manager + 6916u, request_pointer);
+            io_runtime.memory().store32(request_pointer + 24u, byte_count);
+            io_runtime.memory().store32(request_pointer + 48u, 0x08953990u);
+            io_runtime.memory().store32(active_slot, 0u);
+
+            psprecomp::AllegrexContext read_context{};
+            read_context.set_gpr(4u, static_cast<std::uint32_t>(fd));
+            read_context.set_gpr(5u, destination);
+            read_context.set_gpr(6u, byte_count);
+            read_context.set_gpr(22u, umd_manager);
+            read_context.set_gpr(31u, worker_return_pc);
+            io_runtime.invoke_import("IoFileMgrForUser", 0x6A638D83u, read_context);
+
+            require(!io_runtime.stopped() && thread_table.current_uid == submitter_uid &&
+                        deferred_io_resumes.contains(worker_uid) &&
+                        deferred_io_resumes.at(worker_uid).release_pc == 0x08955EA4u,
+                    "watchdog test did not arm the single world-stream commit barrier");
+
+            // threadmain never reaches the commit boundary.
+            virtual_time_us = kDeferredIoWatchdogUs - 1u;
+            vcs_post_dispatch_hook(io_runtime, read_context, unrelated_pc, submitter_uid);
+            require(deferred_io_resumes.contains(worker_uid) &&
+                        thread_table.threads.at(worker_uid).state == ThreadState::IoDeferred &&
+                        deferred_io_watchdog_releases == 0u,
+                    "UMD watchdog released the worker before its time limit");
+
+            virtual_time_us = kDeferredIoWatchdogUs;
+            vcs_post_dispatch_hook(io_runtime, read_context, unrelated_pc, submitter_uid);
+            require(!deferred_io_resumes.contains(worker_uid) &&
+                        deferred_io_watchdog_releases == 1u &&
+                        deferred_io_cross_thread_releases == 0u &&
+                        thread_table.current_uid == worker_uid &&
+                        read_context.pc == worker_return_pc &&
+                        read_context.gpr[2] == byte_count,
+                    "UMD watchdog did not release a barrier whose commit never ran");
+
+            // With the execution-driven clock disabled virtual time stands still,
+            // so only the dispatch count can expire the barrier.
+            virtual_time_us = 0u;
+            DeferredIoResume frozen_clock{};
+            frozen_clock.observed_dispatches = kDeferredIoWatchdogDispatches - 1u;
+            require(!deferred_io_barrier_expired(frozen_clock),
+                    "UMD watchdog dispatch limit fired early with the clock disabled");
+            frozen_clock.observed_dispatches = kDeferredIoWatchdogDispatches;
+            require(deferred_io_barrier_expired(frozen_clock),
+                    "UMD watchdog dispatch limit did not fire with the clock disabled");
+
+            deferred_io_watchdog_releases = 0u;
             file_table = FileTable{};
         }
 
