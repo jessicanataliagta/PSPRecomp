@@ -5028,6 +5028,31 @@ void vcs_module_thread_return(psprecomp::Runtime &runtime, psprecomp::AllegrexCo
     complete_current_thread(runtime, ctx);
 }
 
+std::uint64_t exit_deleted_threads{};
+
+// sceKernelExitDeleteThread ends the calling thread and frees its kernel object
+// and stack at once; only a plain exit (sceKernelExitThread or returning from
+// the entry point) leaves a dormant thread behind for DeleteThread.  VCS starts
+// a short-lived "sfx bank load thread" for every sound-bank load and a
+// "memstick" thread for every save, and both end this way.  Keeping them as
+// Completed records leaked their stacks until sceKernelCreateThread failed with
+// SCE_KERNEL_ERROR_NO_MEMORY; the save code then stored that error as the
+// memstick thread id and its screen waited forever on a black frame.
+void exit_delete_current_thread(psprecomp::Runtime &runtime, psprecomp::AllegrexContext &ctx) {
+    const std::int32_t uid = thread_table.current_uid;
+    complete_current_thread(runtime, ctx);
+    // Still current only when nothing else could run and the runtime stopped.
+    if (thread_table.current_uid == uid) return;
+    const auto found = thread_table.threads.find(uid);
+    if (found == thread_table.threads.end() || found->second.state != ThreadState::Completed) return;
+    remove_thread_from_wait_queues(uid);
+    release_thread_stack(found->second);
+    thread_table.threads.erase(found);
+    ++exit_deleted_threads;
+    if (std::getenv("PSPRECOMP_THREAD_DIAG") != nullptr)
+        std::cerr << "[thread] exit-delete uid=" << uid << "\n";
+}
+
 bool continue_mpeg_ringbuffer_callback(psprecomp::Runtime &runtime,
                                         psprecomp::AllegrexContext &ctx,
                                         AsyncReturnFrame &frame) {
@@ -5545,7 +5570,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
 
     runtime.register_hle("ThreadManForUser", 0x809CE29Bu,
         [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
-            complete_current_thread(rt, ctx);
+            exit_delete_current_thread(rt, ctx);
         });
 
     runtime.register_hle("ThreadManForUser", 0x383F7BCCu,
@@ -9804,6 +9829,89 @@ bool run_profile_self_tests(std::string &error) {
         require(saved_caller != thread_table.continuations.end() && saved_caller->context.pc == 0x08808000u &&
                     saved_caller->context.gpr[2] == 0u,
                 "preempted caller did not preserve its post-HLE return context");
+
+        // sceKernelExitDeleteThread must free the thread and its stack.  VCS
+        // runs one short-lived thread per sound-bank load and per save; when the
+        // stacks leaked, CreateThread eventually returned NO_MEMORY and the save
+        // screen waited forever for a memstick thread that was never created.
+        {
+            psprecomp::Runtime thread_runtime;
+            install_profile(thread_runtime, 0x08E00000u);
+            reset();
+            exit_deleted_threads = 0u;
+
+            constexpr std::int32_t creator_uid = 1;
+            ThreadRecord creator{};
+            creator.name = "threadmain";
+            creator.priority = 32u;
+            creator.state = ThreadState::Running;
+            thread_table.threads.emplace(creator_uid, std::move(creator));
+            thread_table.current_uid = creator_uid;
+            thread_table.next_uid = 2;
+            psprecomp::set_runtime_thread_identity(creator_uid, "threadmain");
+            const std::uint32_t stack_top_before = thread_table.next_stack_top;
+
+            psprecomp::AllegrexContext ctx{};
+            for (int round = 0; round < 200; ++round) {
+                ctx.set_gpr(4u, 0u);           // name
+                ctx.set_gpr(5u, 0x08804000u);  // entry
+                ctx.set_gpr(6u, 40u);          // lower priority than the creator
+                ctx.set_gpr(7u, 0x2000u);      // memstick-sized stack
+                ctx.set_gpr(8u, 0u);
+                ctx.set_gpr(31u, 0x08801000u);
+                thread_runtime.invoke_import("ThreadManForUser", 0x446D8DE6u, ctx);
+                const auto worker_uid = static_cast<std::int32_t>(ctx.gpr[2]);
+                require(worker_uid > 0 && thread_table.threads.contains(worker_uid),
+                        "CreateThread failed while exited threads should have released their stacks");
+
+                ctx.set_gpr(4u, static_cast<std::uint32_t>(worker_uid));
+                ctx.set_gpr(5u, 0u);
+                ctx.set_gpr(6u, 0u);
+                thread_runtime.invoke_import("ThreadManForUser", 0xF475845Du, ctx);
+                require(ctx.gpr[2] == 0u && thread_table.current_uid == creator_uid,
+                        "StartThread of a lower-priority thread did not return to the creator");
+
+                // The creator blocks; the worker runs, then ends with ExitDeleteThread
+                // while the creator is ready again.
+                thread_table.threads.at(creator_uid).state = ThreadState::Sleeping;
+                require(activate_next_thread(ctx, "test-run-worker") && thread_table.current_uid == worker_uid,
+                        "the started thread did not run");
+                enqueue_continuation(creator_uid, ctx);
+                ctx.set_gpr(4u, 0u);
+                thread_runtime.invoke_import("ThreadManForUser", 0x809CE29Bu, ctx);
+                require(!thread_runtime.stopped() && thread_table.current_uid == creator_uid,
+                        "ExitDeleteThread did not switch back to the creator");
+                require(!thread_table.threads.contains(worker_uid),
+                        "ExitDeleteThread left the thread record behind");
+            }
+            require(exit_deleted_threads == 200u, "ExitDeleteThread was not counted for every thread");
+            require(thread_table.next_stack_top == stack_top_before && thread_table.free_stacks.empty(),
+                    "ExitDeleteThread did not return thread stacks to the allocator");
+
+            // A plain exit still leaves a dormant thread for sceKernelDeleteThread.
+            ctx.set_gpr(4u, 0u);
+            ctx.set_gpr(5u, 0x08804000u);
+            ctx.set_gpr(6u, 40u);
+            ctx.set_gpr(7u, 0x800u);
+            ctx.set_gpr(8u, 0u);
+            thread_runtime.invoke_import("ThreadManForUser", 0x446D8DE6u, ctx);
+            const auto dormant_uid = static_cast<std::int32_t>(ctx.gpr[2]);
+            ctx.set_gpr(4u, static_cast<std::uint32_t>(dormant_uid));
+            ctx.set_gpr(5u, 0u);
+            ctx.set_gpr(6u, 0u);
+            thread_runtime.invoke_import("ThreadManForUser", 0xF475845Du, ctx);
+            thread_table.threads.at(creator_uid).state = ThreadState::Sleeping;
+            require(activate_next_thread(ctx, "test-run-dormant") && thread_table.current_uid == dormant_uid,
+                    "the plain-exit thread did not run");
+            enqueue_continuation(creator_uid, ctx);
+            ctx.set_gpr(4u, 0u);
+            thread_runtime.invoke_import("ThreadManForUser", 0xAA73C935u, ctx);
+            require(thread_table.current_uid == creator_uid && thread_table.threads.contains(dormant_uid) &&
+                        thread_table.threads.at(dormant_uid).state == ThreadState::Completed,
+                    "sceKernelExitThread deleted a thread that the game still has to delete");
+            reset();
+            exit_deleted_threads = 0u;
+        }
 
         // Host-backed UMD reads complete much faster than a physical PSP drive.
         // The worker must remain blocked until the request submitter completes
