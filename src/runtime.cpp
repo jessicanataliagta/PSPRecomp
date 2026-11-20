@@ -1,5 +1,6 @@
 #include "psprecomp/runtime.hpp"
 #include "psprecomp/common.hpp"
+#include "psprecomp/import_trace.hpp"
 
 #include <algorithm>
 #include <array>
@@ -33,6 +34,30 @@ RuntimePreDispatchHook g_pre_dispatch_hook = nullptr;
 RuntimePostDispatchHook g_post_dispatch_hook = nullptr;
 RuntimePreChainedCallHook g_pre_chained_call_hook = nullptr;
 RuntimePostChainedCallHook g_post_chained_call_hook = nullptr;
+
+constexpr std::size_t kImportTraceCapacity = 256u;
+std::array<ImportTraceEntry, kImportTraceCapacity> g_import_trace{};
+std::uint64_t g_import_trace_count = 0u;
+
+inline void record_import_call(std::string_view library, std::uint32_t nid,
+                               std::uint32_t return_address) noexcept {
+    ImportTraceEntry &entry = g_import_trace[g_import_trace_count % kImportTraceCapacity];
+    entry.sequence = ++g_import_trace_count;
+    entry.thread_uid = g_runtime_thread_uid;
+    entry.nid = nid;
+    entry.return_address = return_address;
+    entry.library = library;
+}
+}
+
+std::vector<ImportTraceEntry> recent_import_calls() {
+    const std::size_t count = static_cast<std::size_t>(
+        std::min<std::uint64_t>(g_import_trace_count, kImportTraceCapacity));
+    std::vector<ImportTraceEntry> entries;
+    entries.reserve(count);
+    for (std::uint64_t sequence = g_import_trace_count - count; sequence < g_import_trace_count; ++sequence)
+        entries.push_back(g_import_trace[sequence % kImportTraceCapacity]);
+    return entries;
 }
 
 // Execution counter for a handful of guest addresses, armed by
@@ -1149,6 +1174,7 @@ void Runtime::invoke_native_fast_path(std::uint32_t address, AllegrexContext &ct
 void Runtime::invoke_import_cached(std::uint32_t slot, std::string_view library,
                                    std::uint32_t nid, AllegrexContext &ctx) {
     if (hle_histogram_enabled_) ++hle_histogram_[hle_key(library, nid)];
+    record_import_call(library, nid, ctx.gpr[31]);
 
     const HleFunction *bound = slot < import_bindings_.size() ? import_bindings_[slot] : nullptr;
     if (bound == nullptr) {
@@ -1176,6 +1202,7 @@ void Runtime::invoke_import(std::string_view library, std::uint32_t nid, Allegre
     // while a thread spinning on an operation the host never completes shows up
     // as a huge count on one or two wait imports.
     if (hle_histogram_enabled_) ++hle_histogram_[hle_key(library, nid)];
+    record_import_call(library, nid, ctx.gpr[31]);
     const auto library_it = hle_.find(library);
     const auto function_it = library_it != hle_.end()
         ? library_it->second.find(nid) : HleLibrary::const_iterator{};
